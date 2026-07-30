@@ -75,7 +75,7 @@ import * as fsp from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { isObj, mapConcurrent } from "./util";
-import { classifyByCatalog } from "./modelCatalog";
+import { classifyByCatalog, getRatesFor } from "./modelCatalog";
 
 // ─── Public Types ──────────────────────────────────────────────
 
@@ -194,42 +194,19 @@ export function getCopilotHome(copilotHomeOverride?: string): string {
 // ─── Multiplier Resolution ────────────────────────────────────
 
 /**
- * Built-in fallback multipliers for models the live CAPI catalog hasn't
- * loaded yet (extension just activated, network slow, etc.). These match
- * what GitHub publishes at
- * <https://docs.github.com/en/copilot/concepts/billing/copilot-requests>
- * as of 2026-06; the CAPI `/models` response (loaded by `modelCatalog.ts`)
- * is always preferred when available so we automatically pick up new
- * models / rate changes without code edits.
+ * Baseline: gpt-4o's input rate (250 credits per 1M tokens) is the historical
+ * "1×" premium-request cost. Divide any model's input rate by this to derive
+ * a legacy per-prompt multiplier when the catalog doesn't publish one.
  */
-const FALLBACK_MULTIPLIERS: Record<string, number> = {
-  "claude-sonnet-4.6": 1,
-  "claude-sonnet-4.5": 1,
-  "claude-sonnet-4":   1,
-  "claude-opus-4.6":   3,
-  "claude-opus-4.5":   3,
-  "claude-opus-4":     3,
-  "claude-haiku-4.5":  0.33,
-  "claude-haiku-4-5":  0.33,
-  "gpt-4o":            1,
-  "gpt-4o-mini":       0.33,
-  "gpt-4.1":           0,
-  "gpt-5":             1,
-  "gpt-5-mini":        0.33,
-  "o3":                1,
-  "o3-mini":           0.33,
-  "o4-mini":           0.33,
-  "gemini-2.5-pro":    1,
-  "gemini-2.5-flash":  0.33,
-};
+const MULTIPLIER_BASELINE_INPUT_RATE = 250;
 
 function normalizeModelKey(model: string): string {
   return model.toLowerCase().trim();
 }
 
 /**
- * Resolve the AIC multiplier for `model`. Catalog (CAPI) wins; falls back
- * to the built-in table; finally to 1 (conservative — never silently zero).
+ * Resolve the AIC multiplier for `model`. Live catalog multiplier wins,
+ * then derived from live per-1M rates, then a conservative 1.
  */
 function multiplierFor(model: string): number {
   if (!model || model === "unknown") {
@@ -242,14 +219,9 @@ function multiplierFor(model: string): number {
     // user-config/BYOK non-billable alias demote CLI prompts to 0 AIC.
     return cat.multiplier;
   }
-  const key = normalizeModelKey(model);
-  if (key in FALLBACK_MULTIPLIERS) {
-    return FALLBACK_MULTIPLIERS[key];
-  }
-  // family fallback: try stripping a trailing date / minor version.
-  const family = key.replace(/-\d{4}[-.]?\d{2}[-.]?\d{2}$/, "").replace(/\.\d+$/, "");
-  if (family !== key && family in FALLBACK_MULTIPLIERS) {
-    return FALLBACK_MULTIPLIERS[family];
+  const rates = getRatesFor(model);
+  if (rates) {
+    return Math.max(0.25, rates.inputCreditsPerMillion / MULTIPLIER_BASELINE_INPUT_RATE);
   }
   if (cat && typeof cat.multiplier === "number") {
     return cat.multiplier;
@@ -756,5 +728,4 @@ export const __test = {
   isSlashCommand,
   multiplierFor,
   enumerateSessionFiles,
-  FALLBACK_MULTIPLIERS,
 };

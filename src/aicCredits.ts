@@ -12,7 +12,14 @@
  *  - PlanConfig defines plan-level limits and included credits
  *  - AICCalculator computes credits consumed from token counts
  *  - Configuration is loaded from settings with sensible defaults
+ *
+ * Rate resolution order (findModelRate):
+ *   1. Live CAPI catalog via `getRatesFor()` — authoritative when available.
+ *   2. Static `DEFAULT_MODEL_COSTS` / user-supplied `customModelCosts` —
+ *      offline fallback.
  */
+
+import { getRatesFor } from "./modelCatalog";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -141,6 +148,7 @@ export const DEFAULT_MODEL_COSTS: ModelCostRate[] = [
   { model: "claude-opus-4.5",     inputCreditsPerMillion: 500, outputCreditsPerMillion: 2500, cachedInputCreditsPerMillion: 50, cacheWriteCreditsPerMillion: 625, tier: "premium" },
   { model: "claude-sonnet-4.6",   inputCreditsPerMillion: 300, outputCreditsPerMillion: 1500, cachedInputCreditsPerMillion: 30, cacheWriteCreditsPerMillion: 375, tier: "base" },
   { model: "claude-sonnet-4.5",   inputCreditsPerMillion: 300, outputCreditsPerMillion: 1500, cachedInputCreditsPerMillion: 30, cacheWriteCreditsPerMillion: 375, tier: "base" },
+  { model: "claude-sonnet-5",     inputCreditsPerMillion: 200, outputCreditsPerMillion: 1000, cachedInputCreditsPerMillion: 20, cacheWriteCreditsPerMillion: 250, tier: "base" },
   { model: "claude-sonnet-4",     inputCreditsPerMillion: 300, outputCreditsPerMillion: 1500, cachedInputCreditsPerMillion: 30, cacheWriteCreditsPerMillion: 375, tier: "base" },
   { model: "claude-haiku-4.5",    inputCreditsPerMillion: 100, outputCreditsPerMillion: 500,  cachedInputCreditsPerMillion: 10, cacheWriteCreditsPerMillion: 125, tier: "base" },
 
@@ -148,6 +156,9 @@ export const DEFAULT_MODEL_COSTS: ModelCostRate[] = [
   // Source: https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing#openai
   { model: "gpt-4o-mini",          inputCreditsPerMillion: 15,  outputCreditsPerMillion: 60,   cachedInputCreditsPerMillion: 7.5,  cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gpt-4o",               inputCreditsPerMillion: 250, outputCreditsPerMillion: 1000, cachedInputCreditsPerMillion: 125,  cacheWriteCreditsPerMillion: 0, tier: "base" },
+  { model: "gpt-5.6-sol",         inputCreditsPerMillion: 500, outputCreditsPerMillion: 3000, cachedInputCreditsPerMillion: 50,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
+  { model: "gpt-5.6-terra",       inputCreditsPerMillion: 250, outputCreditsPerMillion: 1500, cachedInputCreditsPerMillion: 25,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
+  { model: "gpt-5.6-luna",        inputCreditsPerMillion: 100, outputCreditsPerMillion: 600,  cachedInputCreditsPerMillion: 10,   cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gpt-5.5",             inputCreditsPerMillion: 500, outputCreditsPerMillion: 3000, cachedInputCreditsPerMillion: 50,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
   { model: "gpt-5.4",             inputCreditsPerMillion: 250, outputCreditsPerMillion: 1500, cachedInputCreditsPerMillion: 25,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
   { model: "gpt-5.4-mini",        inputCreditsPerMillion: 75,  outputCreditsPerMillion: 450,  cachedInputCreditsPerMillion: 7.5,  cacheWriteCreditsPerMillion: 0, tier: "base" },
@@ -160,10 +171,14 @@ export const DEFAULT_MODEL_COSTS: ModelCostRate[] = [
 
   // ── Google ──
   // Source: https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing#google
+  { model: "gemini-3.6-flash",    inputCreditsPerMillion: 150, outputCreditsPerMillion: 750,  cachedInputCreditsPerMillion: 15,   cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gemini-3.5-flash",    inputCreditsPerMillion: 150, outputCreditsPerMillion: 900,  cachedInputCreditsPerMillion: 15,   cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gemini-3.1-pro",      inputCreditsPerMillion: 200, outputCreditsPerMillion: 1200, cachedInputCreditsPerMillion: 20,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
   { model: "gemini-3-flash",      inputCreditsPerMillion: 50,  outputCreditsPerMillion: 300,  cachedInputCreditsPerMillion: 5,    cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gemini-2.5-pro",      inputCreditsPerMillion: 125, outputCreditsPerMillion: 1000, cachedInputCreditsPerMillion: 12.5, cacheWriteCreditsPerMillion: 0, tier: "premium" },
+
+  // ── Microsoft ──
+  { model: "mai-code-1-flash",    inputCreditsPerMillion: 75,  outputCreditsPerMillion: 450,  cachedInputCreditsPerMillion: 7,    cacheWriteCreditsPerMillion: 0, tier: "base" },
 
   // ── Fine-tuned (GitHub) ──
   { model: "raptor-mini",         inputCreditsPerMillion: 25,  outputCreditsPerMillion: 200,  cachedInputCreditsPerMillion: 2.5,  cacheWriteCreditsPerMillion: 0, tier: "base" },
@@ -365,6 +380,11 @@ export class AICCalculator {
   * Copilot-billable models.
    */
   findModelRate(modelName: string): ModelCostRate | null {
+    // 1) Live CAPI catalog — authoritative and self-updating.
+    const live = getRatesFor(modelName);
+    if (live) return live;
+
+    // 2) Fall back to the static rate table (default + user overrides).
     const lower = modelName.toLowerCase();
 
     // Normalize: replace version-number hyphens with dots

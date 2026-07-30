@@ -8,7 +8,7 @@ import { AgentScanResult } from "./agentScanner";
 import { CliScanResult } from "./cliScanner";
 import { LiveStats, OTelRequest } from "./otelReceiver";
 import { AICCalculator, AICConfig, DEFAULT_AIC_CONFIG, createCalculatorFromConfig, getPromoInfo, classifyModelBillability } from "./aicCredits";
-import { classifyByCatalog } from "./modelCatalog";
+import { classifyByCatalog, getCachedCatalog } from "./modelCatalog";
 
 /**
  * AIC billing effective date. Only sessions/turns on or after this date
@@ -230,6 +230,12 @@ export interface DashboardData {
   currentSessionAIC: number;
   /** Combined AIC contribution from OMP and Pi agent sessions */
   agentSummary: AgentUsageSummary;
+  /**
+   * Lower-cased model id → CAPI billing multiplier. Snapshot of the live
+   * catalog passed to the webview so the dashboard never needs a
+   * hardcoded fallback multiplier table.
+   */
+  modelMultipliers: Record<string, number>;
 }
 
 /** Per-source usage breakdown: VS Code chatSessions, Oh My Pi agent, Pi coding agent */
@@ -1538,6 +1544,18 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
   const sortedSessions = [...sessionsAll].sort((a, b) => (b.last || "").localeCompare(a.last || ""));
   const currentSessionAIC = sortedSessions.length > 0 ? sortedSessions[0].aicCredits : 0;
 
+  // Snapshot the live catalog's multipliers so the webview never falls back
+  // to a hardcoded table. Empty {} when the catalog hasn't loaded yet.
+  const catalog = getCachedCatalog();
+  const modelMultipliers: Record<string, number> = {};
+  if (catalog) {
+    for (const [id, entry] of catalog.byId) {
+      if (typeof entry.multiplier === "number" && entry.multiplier > 0) {
+        modelMultipliers[id] = entry.multiplier;
+      }
+    }
+  }
+
   return {
     allModels,
     dailyByModel,
@@ -1551,5 +1569,6 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     aicSummary,
     currentSessionAIC,
     agentSummary,
+    modelMultipliers,
   };
 }

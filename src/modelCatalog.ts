@@ -116,18 +116,40 @@ interface KnownModelsManifest {
  * One entry from the Copilot CAPI `/models` response. Mirrors
  * `IModelAPIResponse` in microsoft/vscode-copilot-chat
  * (`src/platform/endpoint/common/endpointProvider.ts`).
+ *
+ * Verified against a live business-plan response 2026-07-29:
+ *   billing = { restricted_to[], token_prices: { default, long_context? } }
+ * The legacy `billing.multiplier` / `billing.is_premium` fields are gone —
+ * premium tier is signalled by `model_picker_price_category` and billability
+ * by `token_prices.default.input_price > 0`.
  */
 interface CapiModelResponse {
   id: string;
   vendor?: string;
   name?: string;
   model_picker_enabled?: boolean;
+  model_picker_price_category?: "low" | "medium" | "high" | "very_high" | string;
   preview?: boolean;
   billing?: {
-    is_premium?: boolean;
-    multiplier?: number;
     restricted_to?: string[];
+    token_prices?: {
+      batch_size?: number;
+      default?: TokenPriceBlock;
+      long_context?: TokenPriceBlock;
+    };
   };
+}
+
+/**
+ * Rate block inside `billing.token_prices.default` / `.long_context`.
+ * All values are AI Credits per 1M tokens. Zero means free/utility.
+ */
+interface TokenPriceBlock {
+  input_price?: number;
+  output_price?: number;
+  cache_price?: number;
+  cache_write_price?: number;
+  context_max?: number;
 }
 
 /**
@@ -154,6 +176,13 @@ export interface ModelCatalogEntry {
   isPremium?: boolean;
   preview?: boolean;
   vendor?: string;
+  /** Per-1M token rates parsed from CAPI billing.price when present. */
+  rates?: {
+    inputCreditsPerMillion: number;
+    outputCreditsPerMillion: number;
+    cachedInputCreditsPerMillion: number;
+    cacheWriteCreditsPerMillion: number;
+  };
   /**
    *  • `"capi"`        — entry came from the Copilot CAPI `/models` response.
    *                       `billable === (multiplier > 0)`.
@@ -209,6 +238,60 @@ export function getCachedCatalog(): ModelCatalog | null {
 }
 
 /**
+ * Resolve per-1M token rates for `modelId` from the live catalog.
+ * Returns `null` when the catalog hasn't loaded yet, the model isn't in
+ * CAPI, or CAPI didn't publish rates for it — callers must fall back to
+ * their static rate table in that case.
+ *
+ * The returned shape matches `ModelCostRate` (imported by callers) so
+ * `AICCalculator.findModelRate()` can consume it directly.
+ */
+export function getRatesFor(modelId: string): {
+  model: string;
+  inputCreditsPerMillion: number;
+  outputCreditsPerMillion: number;
+  cachedInputCreditsPerMillion: number;
+  cacheWriteCreditsPerMillion: number;
+  tier: "base" | "premium";
+} | null {
+  if (!cached) return null;
+  const key = modelId.toLowerCase().replace(/(\d)-(\d)/g, "$1.$2");
+  // Try both hyphen and dot forms since CAPI ids and OTel-reported ids differ.
+  const entry = cached.byId.get(key) ?? cached.byId.get(modelId.toLowerCase());
+  if (!entry?.rates) return null;
+  return {
+    model: entry.id,
+    inputCreditsPerMillion: entry.rates.inputCreditsPerMillion,
+    outputCreditsPerMillion: entry.rates.outputCreditsPerMillion,
+    cachedInputCreditsPerMillion: entry.rates.cachedInputCreditsPerMillion,
+    cacheWriteCreditsPerMillion: entry.rates.cacheWriteCreditsPerMillion,
+    tier: entry.isPremium ? "premium" : "base",
+  };
+}
+
+/**
+ * Extract per-1M rates from `billing.token_prices.default`. We use the
+ * `default` block (matches what VS Code's Language Models view displays);
+ * `long_context` is a separate rate tier that kicks in above the model's
+ * `default.context_max` and would need per-request context-size tracking
+ * to apply correctly. Returns null when no default block is present or all
+ * prices are 0 (free / utility / deprecated models).
+ */
+function extractRatesFromCapi(m: CapiModelResponse): ModelCatalogEntry["rates"] {
+  const def = m.billing?.token_prices?.default;
+  if (!def) return undefined;
+  const input = def.input_price ?? 0;
+  const output = def.output_price ?? 0;
+  if (input === 0 && output === 0) return undefined;
+  return {
+    inputCreditsPerMillion: input,
+    outputCreditsPerMillion: output,
+    cachedInputCreditsPerMillion: def.cache_price ?? 0,
+    cacheWriteCreditsPerMillion: def.cache_write_price ?? 0,
+  };
+}
+
+/**
  * Test-only: replace the in-memory catalog snapshot. Lets unit tests
  * exercise `classifyByCatalog()` without performing a real network refresh
  * or hitting the VS Code globalState cache. Production code must not call
@@ -255,9 +338,13 @@ export function classifyByCatalog(modelName: string): ModelCatalogEntry | null {
   if (!cached) {
     return null;
   }
-  const key = modelName.toLowerCase();
+  const lower = modelName.toLowerCase();
+  // OTel and CLI logs report ids with hyphens ("claude-haiku-4-5"); CAPI
+  // publishes them with dots ("claude-haiku-4.5"). Try both forms.
+  const normalized = lower.replace(/(\d)-(\d)/g, "$1.$2");
 
-  const capiEntry = cached.byId.get(key) ?? null;
+  const capiEntry =
+    cached.byId.get(lower) ?? cached.byId.get(normalized) ?? null;
 
   // 1. CAPI says billable → trust CAPI, ignore the BYOK alias collision.
   if (capiEntry && capiEntry.billable) {
@@ -267,7 +354,8 @@ export function classifyByCatalog(modelName: string): ModelCatalogEntry | null {
   // 2. No CAPI billable hit — fall back to the user/runtime third-party
   //    signal. This is where genuine Ollama / LM Studio / BYOK-only ids
   //    (which never appear in CAPI) correctly resolve to non-billable.
-  const thirdPartyVendor = cached.userVendorByModelId.get(key);
+  const thirdPartyVendor =
+    cached.userVendorByModelId.get(lower) ?? cached.userVendorByModelId.get(normalized);
   if (thirdPartyVendor) {
     return {
       id: modelName,
@@ -363,17 +451,38 @@ async function refreshFromNetwork(ctx: vscode.ExtensionContext, log: LogFn): Pro
 
   // ── Copilot CAPI /models — AUTHORITATIVE BILLING SOURCE ──────
   if (capiRes.status === "fulfilled" && capiRes.value) {
+    let ratesParsed = 0;
+    let billableCount = 0;
+    let noRateSample: CapiModelResponse | null = null;
     for (const m of capiRes.value) {
-      const mult = m.billing?.multiplier ?? 0;
+      const rates = extractRatesFromCapi(m);
+      if (rates) ratesParsed++;
+      else if (!noRateSample && m.id !== "trajectory-compaction") noRateSample = m;
+      // Billability now comes from rates (input_price > 0), because the
+      // legacy `billing.multiplier` field was removed from CAPI.
+      const billable = !!rates && rates.inputCreditsPerMillion > 0;
+      if (billable) billableCount++;
+      const cat = m.model_picker_price_category;
       entries.set(m.id.toLowerCase(), {
         id: m.id,
-        billable: mult > 0,
-        multiplier: mult,
-        isPremium: m.billing?.is_premium ?? false,
+        billable,
+        multiplier: rates ? Math.max(0.25, rates.inputCreditsPerMillion / 250) : undefined,
+        isPremium: cat === "high" || cat === "very_high",
         preview: m.preview ?? false,
         vendor: m.vendor,
+        rates,
         source: "capi",
       });
+    }
+    log(
+      `modelCatalog: parsed per-1M rates for ${ratesParsed}/${capiRes.value.length} CAPI models (${billableCount} billable)`
+    );
+    if (ratesParsed === 0 && noRateSample) {
+      // Fired when the response is missing token_prices entirely — usually
+      // means CAPI is serving a legacy schema to our client headers.
+      log(
+        `modelCatalog: no-rates sample id=${noRateSample.id} billing=${JSON.stringify(noRateSample.billing).slice(0, 500)}`
+      );
     }
   }
 
@@ -523,8 +632,15 @@ async function fetchCapiModels(log: LogFn): Promise<CapiModelResponse[] | null> 
         Authorization: `Bearer ${copilotToken}`,
         Accept: "application/json",
         "User-Agent": USER_AGENT,
-        "Editor-Version": "vscode/1.85.0",
+        // Modern client string — GitHub serves the current /models schema
+        // (with `billing.token_prices.default.*_price`) only to recent
+        // clients. Older Editor-Version values (< vscode/1.90) get a legacy
+        // response missing the token_prices block.
+        "Editor-Version": "vscode/1.95.0",
+        "Editor-Plugin-Version": "copilot-chat/0.20.0",
         "Copilot-Integration-Id": "vscode-chat",
+        "X-GitHub-Api-Version": "2025-04-01",
+        "OpenAI-Intent": "model-access",
       },
     });
     if (!modelsRes.ok) {

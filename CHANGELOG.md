@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.33] - 2026-07-29
+
+### Fixed
+
+- **`Usage by Source` table now reconciles with the hero total.** After v1.10.32 aligned the hero with the sidebar via `aic.byDay`, the per-source table's `VS Code (range)` cell still used the old session-only sum, so VS Code + OMP + Pi + CLI came out ~1,600 credits below the hero (that gap = today's live OTel overlay credits, which aren't tied to any single chat session). VS Code cell now shows the residual `rangeAicTotal − OMP − Pi − CLI` — same definition as `agentSummary.vscodeAicCredits` in [dashboardData.ts:1506](src/dashboardData.ts). Applied only when the range is cycle-aligned (`This Month` / `All Time`) so it doesn't over-subtract cycle-scoped agent totals from a shorter window.
+- **`Total` column of `Usage by Source` now shows a number instead of em-dash on `This Month`.** The mixing concern only applied when VS Code was range-scoped and agents were all-time-scoped; with the residual VS Code definition on cycle-aligned ranges, the sum is well-defined and matches the hero.
+
+## [1.10.32] - 2026-07-29
+
+### Fixed
+
+- **Sidebar and dashboard totals now reconcile.** The dashboard hero `AI Credits Spent` card and the `AI Credits (AIC) → Total Credits` tile were both computing their number as `sessions.reduce(aicCredits)` from `sessionsAll`, which contains only VS Code chat sessions. That silently dropped every credit sourced from live OTel overlay, OMP, Pi, and Copilot CLI — while the sidebar was already summing the authoritative all-source `aicSummary.totalCredits`. Result: the two panels showed different cycle totals (e.g. sidebar 83,014 vs dashboard 81,273.5) even though they receive the identical `DashboardData` payload in the same tick.
+- **Dashboard `Projected` cards now match the sidebar's pace projection** for the default `This Month` range. Previously they used a mixed-basis formula (`aic.totalCredits + rangeDailyAvg × daysRemaining` where `rangeDailyAvg` was derived from VS Code sessions only). On the `tm` range they now use `aic.projectedTotal` directly, same as the sidebar.
+
+### Notes
+
+- Fix uses `aicSummary.byDay` (already all-source: VS Code turns + live OTel overlay + OMP + Pi + CLI) as the authoritative per-range credit map, with session aggregation as a fallback for closed periods where `byDay` is empty (past months). The per-day calendar, daily-token chart, and sidebar sparkline are unchanged — only the totals on top of them.
+
+## [1.10.31] - 2026-07-29
+
+### Fixed
+
+- **Modernized CAPI request headers.** v1.10.30 correctly parsed `billing.token_prices.default.*_price` but was still seeing 0/38 rates in production. Root cause: our request advertised `Editor-Version: vscode/1.85.0` (Dec 2023), and GitHub CAPI serves a legacy `/models` schema without `token_prices` to old clients. Updated to `vscode/1.95.0` + added `Editor-Plugin-Version`, `X-GitHub-Api-Version`, `OpenAI-Intent` headers so we get the same modern response the built-in Copilot Chat receives.
+- **Added targeted rate-miss diagnostic.** If rates still can't be parsed, one log line dumps the raw `billing` block of a sample model — makes any future schema drift instantly visible.
+
+## [1.10.30] - 2026-07-29
+
+### Fixed
+
+- **CAPI pricing schema corrected.** v1.10.28's rate parser guessed the field path (`billing.price`) but the real CAPI response nests rates under `billing.token_prices.default.{input_price,output_price,cache_price,cache_write_price}`. Result: `parsed per-1M rates for 0/38 CAPI models` in production. Now reads the real path and picks up rates for every model that has a `default` price block.
+- **Billability signal rebuilt.** CAPI dropped `billing.multiplier` and `billing.is_premium` entirely. The old `billable = multiplier > 0` check was silently marking every model non-billable. Now derives billability from `token_prices.default.input_price > 0` and premium tier from `model_picker_price_category` (`high` / `very_high` → premium).
+- **Live-estimate multiplier derived from rates.** Since CAPI no longer publishes a per-prompt multiplier, `ModelCatalogEntry.multiplier` is now computed as `max(0.25, input_price / 250)` (gpt-4o baseline = 1×). CLI ledger's `session.shutdown.modelMetrics` remains authoritative when present — the multiplier only estimates in-flight sessions.
+
+### Removed
+
+- v1.10.29's schema-probe diagnostic (its job is done — real schema is now hardcoded).
+
+## [1.10.29] - 2026-07-29
+
+### Changed
+
+- **Improved CAPI schema diagnostic.** v1.10.28's probe only fired when at least one entry had a `billing` field. Real-world CAPI responses (business plan, `api.business.githubcopilot.com`) return 38 models with `billing` completely absent, so the log stayed silent. The probe now dumps the first entry unconditionally and reports how many entries carry a `billing` block — giving us the raw shape needed to locate whatever pricing field CAPI actually uses.
+
+## [1.10.28] - 2026-07-29
+
+### Added
+
+- **Dynamic per-model pricing from the Copilot CAPI catalog.** The extension already fetches `/models` from the Copilot API to determine billability; it now also parses `billing.price` (with defensive fallbacks for `rates` / `pricing` and multiple field-name spellings) into per-1M input / output / cache-read / cache-write rates. `AICCalculator.findModelRate()` consults the live catalog first and falls back to `DEFAULT_MODEL_COSTS` only when the catalog is unreachable or missing rates for a model. Any new model GitHub adds to CAPI is now priced correctly at the next 24 h refresh with zero code changes.
+- **Six missing models added to the static fallback table:** `claude-sonnet-5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gemini-3.6-flash`, `mai-code-1-flash`. Previously these fell through to the GPT-4.1 default rate (200 in / 800 out per 1M), silently misestimating credits.
+- **Diagnostic CAPI schema probe** — one log line in `fetchCapiModels()` dumps the first entry's `billing` block on refresh so we can confirm the real field names.
+
+### Changed
+
+- **`FALLBACK_MULTIPLIERS` in `cliScanner.ts` removed** (18 hardcoded entries). `multiplierFor()` is now: live catalog multiplier → rate-derived multiplier → 1.
+- **`KNOWN_MULT` constant in the webview removed.** The dashboard now reads `DATA.modelMultipliers`, a live snapshot pushed from the extension side via `buildDashboardData()`.
+- **Hyphen↔dot key normalization in `classifyByCatalog()`** — CAPI publishes `claude-haiku-4.5` but OTel and CLI logs report `claude-haiku-4-5`. Both forms now resolve.
+
 ## [1.10.27] - 2026-07-04
 
 ### Fixed

@@ -72,7 +72,7 @@ if (!cliMod || !cliMod.__test) {
   process.exit(2);
 }
 const { scanCliSessions, getCopilotHome } = cliMod;
-const { parseSessionContent, isSlashCommand, multiplierFor, enumerateSessionFiles, FALLBACK_MULTIPLIERS } = cliMod.__test;
+const { parseSessionContent, isSlashCommand, multiplierFor, enumerateSessionFiles } = cliMod.__test;
 const { __setCatalogForTesting } = require(path.join(OUT, "modelCatalog.js"));
 
 // ── tiny assert harness ──────────────────────────────────────────────
@@ -109,15 +109,24 @@ assert("non-string input is false", !isSlashCommand(null) && !isSlashCommand(und
 
 // Multiplier resolution
 console.log("-- A.2 multiplierFor --");
+// Seed the live catalog with the multipliers this test expects.
+// The old FALLBACK_MULTIPLIERS table has been removed — multiplierFor now
+// reads exclusively from the CAPI catalog (with a rates-derived fallback).
+__setCatalogForTesting({
+  fetchedAt: Date.now(),
+  byId: new Map([
+    ["claude-sonnet-4",   { id: "claude-sonnet-4",   billable: true, multiplier: 1,    source: "capi" }],
+    ["claude-haiku-4.5",  { id: "claude-haiku-4.5",  billable: true, multiplier: 0.33, source: "capi" }],
+    ["claude-opus-4",     { id: "claude-opus-4",     billable: true, multiplier: 3,    source: "capi" }],
+  ]),
+  cdnProviders: {},
+  userVendorByModelId: new Map(),
+});
 assert("claude-sonnet-4 → 1", multiplierFor("claude-sonnet-4") === 1, multiplierFor("claude-sonnet-4"));
 assert("claude-haiku-4-5 → 0.33", multiplierFor("claude-haiku-4-5") === 0.33, multiplierFor("claude-haiku-4-5"));
 assert("CLAUDE-OPUS-4 (case insensitive) → 3", multiplierFor("CLAUDE-OPUS-4") === 3, multiplierFor("CLAUDE-OPUS-4"));
 assert("unknown model defaults to 1 (conservative)", multiplierFor("totally-made-up-model-xyz") === 1);
 assert("empty/unknown returns 1", multiplierFor("") === 1 && multiplierFor("unknown") === 1);
-assert("FALLBACK table includes the documented set",
-  "claude-sonnet-4" in FALLBACK_MULTIPLIERS &&
-  "claude-haiku-4-5" in FALLBACK_MULTIPLIERS &&
-  "gpt-4o-mini" in FALLBACK_MULTIPLIERS);
 __setCatalogForTesting({
   fetchedAt: Date.now(),
   byId: new Map(),
@@ -129,7 +138,19 @@ assert(
   multiplierFor("claude-sonnet-4.6") === 1,
   multiplierFor("claude-sonnet-4.6"),
 );
-__setCatalogForTesting(null);
+// Keep the multiplier catalog seeded for parser tests below — parseSessionContent
+// computes each model's live AIC via multiplierFor at parse time, so it needs
+// haiku=0.33, sonnet=1, opus=3 to be reachable through the catalog.
+__setCatalogForTesting({
+  fetchedAt: Date.now(),
+  byId: new Map([
+    ["claude-sonnet-4",   { id: "claude-sonnet-4",   billable: true, multiplier: 1,    source: "capi" }],
+    ["claude-haiku-4.5",  { id: "claude-haiku-4.5",  billable: true, multiplier: 0.33, source: "capi" }],
+    ["claude-opus-4",     { id: "claude-opus-4",     billable: true, multiplier: 3,    source: "capi" }],
+  ]),
+  cdnProviders: {},
+  userVendorByModelId: new Map(),
+});
 
 // Parser — synthesize a tiny session
 console.log("-- A.3 parseSessionContent attribution & hybrid --");

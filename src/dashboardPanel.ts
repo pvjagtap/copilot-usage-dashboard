@@ -356,7 +356,6 @@ td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
 let DATA = ${jsonData};
 const MODEL_COLORS = ['#58a6ff','#3fb950','#bc8cff','#d29922','#f85149','#79c0ff','#f778ba','#a5d6ff'];
 const RANGE_LABELS = {'7d':'Last 7 Days','30d':'Last 30 Days','90d':'Last 90 Days','tw':'This Week','tm':'This Month','pm':'Prev Month','jan':'January','feb':'February','mar':'March','apr':'April','may':'May','jun':'June','jul':'July','aug':'August','sep':'September','oct':'October','nov':'November','dec':'December','all':'All Time'};
-const KNOWN_MULT = {'claude-opus':3,'claude-sonnet':1,'claude-haiku':0.25,'gpt-5.5':7.5,'gpt-5.4':1,'gpt-5':1,'gpt-4.1':1,'gpt-4o-mini':0.25,'gpt-4.1-mini':0.25,'o3':3,'o3-mini':0.25,'o4-mini':0.25,'gemini-2.5-pro':3,'gemini-2.0-flash':0.25};
 
 const vscode = acquireVsCodeApi();
 const _saved = vscode.getState() || {};
@@ -389,7 +388,10 @@ function mc(m) {
 function getMult(model, sm) {
   if (sm && sm > 0) return sm;
   const l = model.toLowerCase();
-  for (const [k,v] of Object.entries(KNOWN_MULT)) { if (l.includes(k)) return v; }
+  const mm = DATA.modelMultipliers || {};
+  if (mm[l] > 0) return mm[l];
+  // Substring: catch "gpt-4o-mini-2024-07-18" via catalog key "gpt-4o-mini".
+  for (const [k, v] of Object.entries(mm)) { if (v > 0 && l.includes(k)) return v; }
   return 1;
 }
 function mbadge(m) {
@@ -594,8 +596,23 @@ function render() {
   const refreshStatus = selectedRefresh > 0 ? '' : ' (auto-refresh off)';
   document.getElementById('subtitle').textContent = 'Updated: '+DATA.generatedAt+' — '+rl+refreshStatus;
 
-  // Compute range-filtered AIC total from per-session credits
-  const rangeAicTotal = sessions.reduce((s,x) => s + (x.aicCredits || 0), 0);
+  // Authoritative per-day credit map for the selected range. aic.byDay is
+  // built from computeSummary(creditEntries) and already includes every
+  // source (VS Code turns + live OTel overlay + OMP + Pi + CLI), so the
+  // dashboard reconciles with the sidebar. Session fallback fills days
+  // outside the current billing cycle (past months where byDay is empty).
+  const rangeAicDayMap = {};
+  (DATA.aicSummary && DATA.aicSummary.byDay || []).forEach(d => {
+    if ((!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end)) {
+      rangeAicDayMap[d.day] = d.credits;
+    }
+  });
+  sessions.forEach(s => {
+    if (s.lastDate && s.aicCredits && !(s.lastDate in rangeAicDayMap)) {
+      rangeAicDayMap[s.lastDate] = (rangeAicDayMap[s.lastDate] || 0) + s.aicCredits;
+    }
+  });
+  const rangeAicTotal = Object.values(rangeAicDayMap).reduce((s, v) => s + v, 0);
   const aicTotal = rangeAicTotal.toFixed(1);
   const aicBudget = DATA.aicSummary ? DATA.aicSummary.monthlyBudget : 0;
   const ag = DATA.agentSummary;
@@ -605,24 +622,19 @@ function render() {
     : aicSub;
 
   // === HERO KPIs (4 headline cards with deltas & accent stripes) ===
-  // Build a per-day credit map from filtered sessions so daily average works
-  // for ANY range (not just current billing cycle). Then compute daily average
-  // from actually-populated days.
-  const heroSessionDayMap = {};
-  sessions.forEach(s => {
-    if (s.lastDate && s.aicCredits) {
-      heroSessionDayMap[s.lastDate] = (heroSessionDayMap[s.lastDate] || 0) + s.aicCredits;
-    }
-  });
-  const heroActiveDayCount = Object.keys(heroSessionDayMap).length || 1;
+  const heroActiveDayCount = Object.keys(rangeAicDayMap).length || 1;
   const heroDailyAvg = rangeAicTotal / heroActiveDayCount;
 
   // Only project/runway when the selected range is live (includes today).
   // For closed periods (Prev Month, a past named month), projection & runway
   // are meaningless — the period is done.
   const rangeIsLive = rangeIncludesToday(selectedRange);
+  // For the default 'This Month' range use aic.projectedTotal directly so
+  // the number matches the sidebar's pace card (same all-source basis).
   const heroProjected = rangeIsLive && DATA.aicSummary && DATA.aicSummary.daysRemaining > 0
-    ? DATA.aicSummary.totalCredits + (heroDailyAvg * DATA.aicSummary.daysRemaining)
+    ? (selectedRange === 'tm'
+        ? DATA.aicSummary.projectedTotal
+        : DATA.aicSummary.totalCredits + (heroDailyAvg * DATA.aicSummary.daysRemaining))
     : rangeAicTotal;
 
   let runwayTxt = '';
@@ -702,7 +714,7 @@ function render() {
 
   renderOtel(DATA.liveOtel);
   renderAIC(DATA.aicSummary, bounds, sessions);
-  renderAgentSessions(DATA.agentSummary, bounds, sessions);
+  renderAgentSessions(DATA.agentSummary, bounds, sessions, rangeAicTotal);
   renderDaily(daily);
   renderModelPie(sessions);
   renderProjectBar(sessions);
@@ -870,36 +882,37 @@ function renderAIC(aic, bounds, filteredSessions) {
     return;
   }
 
-  // Range-filtered totals from sessions
-  const rangeTotal = filteredSessions.reduce((s,x) => s + (x.aicCredits || 0), 0);
-
-  // Build a per-day credit map from filtered sessions. This is authoritative
-  // for ANY range (past months, current cycle) because it aggregates the
-  // per-session aicCredits by lastDate. aic.byDay only covers the
-  // current billing cycle and cannot be trusted for historical ranges.
+  // Build authoritative per-day credit map first. aic.byDay already blends
+  // VS Code turns + live OTel overlay + OMP + Pi + CLI (from
+  // computeSummary(creditEntries)), so summing it makes this section
+  // reconcile with the sidebar. Session aggregation fills days outside the
+  // current cycle (past months where byDay is empty).
   const sessionDayMap = {};
   filteredSessions.forEach(s => {
     if (s.lastDate && s.aicCredits) {
       sessionDayMap[s.lastDate] = (sessionDayMap[s.lastDate] || 0) + s.aicCredits;
     }
   });
-  // Prefer aic.byDay for days it covers (per-request precision from turns),
-  // fall back to session aggregation for days outside the current cycle.
   const filteredByDay = (aic.byDay||[]).filter(d => (!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end));
   const finalDayMap = {};
   filteredByDay.forEach(d => { finalDayMap[d.day] = d.credits; });
   Object.entries(sessionDayMap).forEach(([day, credits]) => {
     if (!(day in finalDayMap)) { finalDayMap[day] = credits; }
   });
+  const rangeTotal = Object.values(finalDayMap).reduce((s, v) => s + v, 0);
 
   // Daily average from days that actually had activity — accurate for any range.
   const activeDayCount = Object.keys(finalDayMap).length || 1;
   const rangeDailyAvg = rangeTotal / activeDayCount;
 
   // Projection only makes sense when the range is live (includes today).
+  // For the 'This Month' default use aic.projectedTotal directly so the
+  // number matches the sidebar's pace card (same all-source basis).
   const aicRangeIsLive = rangeIncludesToday(selectedRange);
   const rangeProjected = aicRangeIsLive && aic.daysRemaining > 0
-    ? aic.totalCredits + (rangeDailyAvg * aic.daysRemaining)
+    ? (selectedRange === 'tm'
+        ? aic.projectedTotal
+        : aic.totalCredits + (rangeDailyAvg * aic.daysRemaining))
     : rangeTotal;
 
   const pct = aic.monthlyBudget > 0 ? Math.min(100, Math.round((rangeTotal / aic.monthlyBudget) * 100)) : 0;
@@ -1058,7 +1071,7 @@ function renderAIC(aic, bounds, filteredSessions) {
     + '</div>';
 }
 
-function renderAgentSessions(agent, bounds, filteredSessions) {
+function renderAgentSessions(agent, bounds, filteredSessions, rangeAicTotal) {
   const el = document.getElementById('agent-section');
   if (!agent) { el.innerHTML = ''; return; }
 
@@ -1069,11 +1082,20 @@ function renderAgentSessions(agent, bounds, filteredSessions) {
   const vscodeSessions = filteredSessions.length;
   const vscodeTurns = filteredSessions.reduce((s,x) => s + x.turns, 0);
   const vscodeTotalTokens = filteredSessions.reduce((s,x) => s + (x.actualPrompt||x.prompt) + (x.actualOutput||x.output), 0);
-  const vscodeAicCredits = filteredSessions.reduce((s,x) => s + (x.aicCredits||0), 0);
 
   const cliDisplayCredits = (agent.cliTotalCredits && agent.cliTotalCredits > 0)
     ? agent.cliTotalCredits
     : (agent.cliLlmCalls && agent.cliLlmCalls > 0 ? agent.cliLlmCalls : 0);
+
+  // VS Code AIC = authoritative range total minus source-attributed buckets.
+  // Matches agentSummary.vscodeAicCredits (dashboardData.ts) and includes
+  // live OTel overlay credits that aren't tied to any single chat session.
+  // For non-cycle ranges we fall back to the session sum since agent totals
+  // are cycle/all-time scoped (mixing them would over-subtract).
+  const isCycleAlignedRange = selectedRange === 'tm' || selectedRange === 'all' || (!bounds.start && !bounds.end);
+  const vscodeAicCredits = isCycleAlignedRange && typeof rangeAicTotal === 'number'
+    ? Math.max(0, rangeAicTotal - (agent.ompTotalCredits||0) - (agent.piTotalCredits||0) - cliDisplayCredits)
+    : filteredSessions.reduce((s,x) => s + (x.aicCredits||0), 0);
   const hasAgentData = agent.ompSessions > 0 || agent.piSessions > 0 || agent.cliSessions > 0;
   const agentNote = hasAgentData
     ? ''
@@ -1108,13 +1130,13 @@ function renderAgentSessions(agent, bounds, filteredSessions) {
   // because those scanners don't expose per-date granularity to the webview.
   // We DO NOT sum them into a single Total — mixing a filtered window with
   // all-time data would be misleading. Show em-dash placeholder for Total when
-  // any range other than all-time is selected.
+  // any range other than all-time (or cycle-aligned 'tm') is selected.
   const isAllTimeRange = !bounds.start && !bounds.end;
   const totalSess  = vscodeSessions + (agent.ompSessions||0) + (agent.piSessions||0) + (agent.cliSessions||0);
   const totalCalls = vscodeTurns + (agent.ompLlmCalls||0) + (agent.piLlmCalls||0) + (agent.cliLlmCalls||0);
   const totalTok   = vscodeTotalTokens + (agent.ompAllTimeTokens||0) + (agent.piAllTimeTokens||0) + (agent.cliAllTimeTokens||0);
   const totalAIC   = fmtAIC(vscodeAicCredits + (agent.ompTotalCredits||0) + (agent.piTotalCredits||0) + cliDisplayCredits);
-  const totalCell = v => isAllTimeRange
+  const totalCell = v => isCycleAlignedRange
     ? '<td class="num orange"><strong>'+v+'</strong></td>'
     : '<td class="num" style="color:var(--muted)" title="VS Code is range-filtered; OMP/Pi/CLI are all-time — a combined total would mix time windows">—</td>';
 

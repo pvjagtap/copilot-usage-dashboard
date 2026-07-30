@@ -766,5 +766,117 @@ when <code>sessionId</code> is still empty. The <code>sid</code> field is presen
   <li>No change to dashboard rendering or AIC calculation logic</li>
 </ul>
 
+<h2>13. Dynamic per-model pricing (July 2026) <span class="ok">DONE</span></h2>
+
+<h3>Problem</h3>
+<p>
+Three independent hardcoded pricing tables drifted apart because they were only
+updated when GitHub announced new models:
+</p>
+<ol>
+  <li><code>DEFAULT_MODEL_COSTS</code> in <code>src/aicCredits.ts</code> — per-1M input/output/cache rates.</li>
+  <li><code>FALLBACK_MULTIPLIERS</code> in <code>src/cliScanner.ts</code> — legacy per-prompt multipliers.</li>
+  <li><code>KNOWN_MULT</code> in <code>src/dashboardPanel.ts</code> — a third multiplier copy inside the webview.</li>
+</ol>
+<p>
+Six models VS Code's own Language Models view was already pricing were
+absent from all three tables: <code>claude-sonnet-5</code>,
+<code>gpt-5.6-{luna,sol,terra}</code>, <code>gemini-3.6-flash</code>, and
+<code>mai-code-1-flash</code>. Any of these routed through the extension
+was silently priced at GPT-4.1's fallback rate (200 in / 800 out per 1M).
+</p>
+
+<h3>Design decision — CAPI-first, three-tier fallback</h3>
+<p>
+The Copilot CAPI <code>/models</code> endpoint (which the extension already
+calls to determine <em>billability</em>) is the same source VS Code's built-in
+"Language Models" view reads its per-1M cost columns from. We extended the
+existing catalog to also parse the per-token rates and made the rate-lookup
+chain read:
+</p>
+<pre>1. Live CAPI catalog via getRatesFor()  ← authoritative, self-updating
+2. Static DEFAULT_MODEL_COSTS           ← offline emergency net
+3. Hardcoded GPT-4.1 default            ← final fallback</pre>
+
+<h3>Deviations from the initial plan</h3>
+<ul>
+  <li>The initial plan assumed the CAPI response would carry <code>billing.price</code>
+      with a fixed field shape. Because we couldn't verify the schema without a live
+      network call, <code>CapiPriceShape</code> defensively accepts three container
+      names (<code>price</code> | <code>rates</code> | <code>pricing</code>) and three
+      spellings per field (<code>input</code>/<code>in</code>/<code>input_tokens</code>,
+      etc.). <code>extractRatesFromCapi()</code> tolerates whichever CAPI actually
+      emits — no code change needed if the field name flips.</li>
+  <li>A one-shot diagnostic log line in <code>fetchCapiModels()</code> dumps the first
+      entry's <code>billing</code> block so we can confirm the real schema from any
+      user's log rather than guessing.</li>
+  <li>The initial plan said to <em>delete</em> <code>FALLBACK_MULTIPLIERS</code>
+      wholesale. We did — but the existing CLI-scanner test asserted specific
+      values through that table. Rather than deleting the assertions, we
+      updated the test to seed the catalog directly, which now exercises the
+      new resolver path instead.</li>
+  <li>Similarly, <code>KNOWN_MULT</code> in the webview was deleted and replaced
+      by a <code>DATA.modelMultipliers</code> snapshot pushed from the extension
+      side (populated from the live catalog in <code>buildDashboardData()</code>).</li>
+  <li>Added hyphen↔dot normalization to <code>classifyByCatalog()</code> — CAPI
+      publishes ids as <code>claude-haiku-4.5</code> but OTel and CLI logs
+      report <code>claude-haiku-4-5</code>. Both forms now resolve.</li>
+</ul>
+
+<h3>Tradeoffs</h3>
+<ul>
+  <li><strong>Rate-derived multiplier vs "1".</strong> When the catalog knows the
+      per-1M rates but not the per-prompt multiplier, we derive it as
+      <code>max(0.25, inputCreditsPerMillion / 250)</code> where 250 is
+      GPT-4o's baseline rate. This is a rough proxy but strictly better than
+      the previous "just return 1" behavior. Cap at 0.25 prevents underflow
+      for very cheap models.</li>
+  <li><strong>Kept <code>DEFAULT_MODEL_COSTS</code> as fallback.</strong> Considered
+      trimming to 5 ids as the design proposed, but leaving the full table
+      is cheap (~40 lines) and gives us offline resilience during the
+      ~200ms activation window before the CAPI catalog resolves. It only
+      wins when the catalog is missing OR missing rates for a specific
+      model, so drift risk is bounded.</li>
+</ul>
+
+<h3>Files changed</h3>
+<table>
+  <thead><tr><th>File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>src/aicCredits.ts</code></td><td>Added 6 missing models to <code>DEFAULT_MODEL_COSTS</code>. Rewrote <code>findModelRate()</code> to consult <code>getRatesFor()</code> first.</td></tr>
+    <tr><td><code>src/modelCatalog.ts</code></td><td>Added <code>CapiPriceShape</code>, extended <code>ModelCatalogEntry</code> with <code>rates</code>, added <code>extractRatesFromCapi()</code> and <code>getRatesFor()</code>, added CAPI schema-probe log line, hyphen↔dot normalization in <code>classifyByCatalog()</code>.</td></tr>
+    <tr><td><code>src/cliScanner.ts</code></td><td>Deleted 18-entry <code>FALLBACK_MULTIPLIERS</code> table. <code>multiplierFor()</code> now: CAPI multiplier → rate-derived multiplier → 1.</td></tr>
+    <tr><td><code>src/dashboardData.ts</code></td><td>Added <code>modelMultipliers</code> to <code>DashboardData</code>, populated from live catalog.</td></tr>
+    <tr><td><code>src/dashboardPanel.ts</code></td><td>Deleted <code>KNOWN_MULT</code> constant. <code>getMult()</code> now reads <code>DATA.modelMultipliers</code>.</td></tr>
+    <tr><td><code>tests/verify-cli-scanner.js</code></td><td>Removed <code>FALLBACK_MULTIPLIERS</code> assertion. Test now seeds the catalog directly and exercises the resolver.</td></tr>
+  </tbody>
+</table>
+
+<h3>Verification</h3>
+<ul>
+  <li><code>tests/verify-cli-scanner.js</code>: <span class="ok">71 passed, 0 failed</span></li>
+  <li><code>tests/verify-byok-billable-regression.js</code>: <span class="ok">all passed</span></li>
+  <li><code>tests/verify-rate-match-provider-guard.js</code>: <span class="ok">all passed</span></li>
+  <li><code>tests/verify-webview-html.js</code>: <span class="ok">script parses OK</span></li>
+  <li>Remaining failures on <code>verify-no-drift</code>, <code>verify-dashboard-vs-api</code>,
+      and <code>verify-sidebar-dashboard-parity</code> were confirmed present on
+      <code>main</code> before this change — <span class="ok">zero regressions</span>.</li>
+</ul>
+
+<h3>Open questions</h3>
+<ul>
+  <li>Once the extension runs against real CAPI, read the diagnostic log line
+      to lock down which container / field names <code>billing</code> actually
+      uses. If it consistently emits e.g. <code>billing.price.input</code>,
+      the defensive alternation in <code>CapiPriceShape</code> can be
+      tightened to a single shape and the log line removed.</li>
+  <li><code>DEFAULT_MODEL_COSTS</code> can be aggressively trimmed once we're
+      confident CAPI reliably returns rates for all Copilot-billed models.
+      Leaving as-is for now.</li>
+  <li>The rate-derived multiplier formula (<code>input/250</code>) assumes
+      GPT-4o remains the "1×" baseline. If GitHub changes the baseline
+      model, this constant needs updating.</li>
+</ul>
+
 </body>
 </html>
