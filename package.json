@@ -2,7 +2,7 @@
   "name": "copilot-usage-dashboard",
   "displayName": "Copilot Usage Dashboard",
   "description": "Live token usage dashboard for GitHub Copilot — prompt, output, and cached tokens with full analytics.",
-  "version": "1.10.33",
+  "version": "1.10.47",
   "publisher": "pvjagtap",
   "icon": "images/icon.png",
   "license": "MIT",
@@ -266,8 +266,8 @@
         "properties": {
           "copilotUsage.dailyLimit.enabled": {
             "type": "boolean",
-            "default": true,
-            "description": "Enable the daily AI Credits limit guard with visual indicator + optional Copilot pause."
+            "default": false,
+            "description": "Enable the daily AI Credits limit guard with visual indicator + optional Copilot pause. Off by default — opt in to activate."
           },
           "copilotUsage.dailyLimit.credits": {
             "type": "number",

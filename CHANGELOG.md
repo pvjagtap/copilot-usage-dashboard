@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.47] - 2026-07-31
+
+### Changed
+
+- **Daily AI Credit Limit Guard is now OFF by default.** `copilotUsage.dailyLimit.enabled` default flipped from `true` to `false`. Fresh installs no longer show the status-bar countdown, mascot overlay, or install `~/.copilot/hooks/` unless the user explicitly opts in via Settings. Existing users' saved preference is preserved.
+- **Dashboard bento layout.** AI Credits billing card (with its inner `AI Credits By Model` + `Daily Credits` calendar) now occupies an 8-column right tile, with the secondary meters (`More Details`, `Live OpenTelemetry`) stacked in a 4-column side rail on the left. Below 1100px viewport the row collapses to a single stacked column. Zero data drift — same section IDs, same JS rendering.
+- **Filter bar inline with title.** Title and filter dropdowns share one top row instead of stacking vertically. Body top padding tightened so the dashboard reads higher on first paint.
+- **Hero and stat card layout unified.** Every tiled KPI (hero row, `More Details`, `Live OpenTelemetry`, AI Credits KPIs, overage row) uses the same 2-column grid: label + sub on the left, number centered in a reserved right column with `minmax(140px, 42%)` for hero and `minmax(120px, 40%)` for stat cards. Numbers no longer clip; labels no longer truncate with `...`.
+- **Typography audit — Space Grotesk sitewide.** Space Grotesk (Google Fonts, weights 400/500/600/700) applied to `body` with tabular numerals and stylistic set 1 enabled. Chart.js `defaults.font.family` also set so every chart tick, label, legend, and tooltip renders in the same font — By Project, By Tool, By Subagent, By Model, Daily Token Usage, and Hourly Distribution.
+- **Font-size and font-weight bump across the whole dashboard.** Root cause of "faint" text: dark-theme `--muted` was `#8b949e` on `#0d1117` — low contrast. Brightened to `#a8b1bb` (dark) and darkened to `#5a544f` (light). Sizes bumped 1–2px on labels, subs, table cells, insight captions, notes, expander summaries, chart headings; weights bumped from 400/600 to 500/700 on labels. Section titles and chart headings promoted from muted → `--fg` for proper heading contrast.
+- **README trimmed** from 159 lines to 27 lines. Install, open command, five essential settings, license.
+
+### Added
+
+- **[ARCHITECTURE.md](ARCHITECTURE.md).** New file containing the full technical reference previously buried in the README: data source paths per platform, JSONL parsing internals for `kind=0/1/2`, `main.jsonl` / `runSubagent-*.jsonl` / `title-*.jsonl` handling, Oh My Pi + Pi source integration, OTel auto-config, AIC configuration + plan defaults + custom model costs + credit formulas, Daily Limit Guard complete settings reference, agent-hooks section, features summary. Linked from README under `Configure`.
+- **Per-project cost in Breakdown → By Project.** Each project bar now shows its dollar cost `$XX.XX` in orange bold at the right edge of the chart, painted by a Chart.js `afterDatasetsDraw` plugin with `layout.padding.right: 82` reserved so it never overlaps the bar. Tooltip footer shows `Credits: X.X · $Y.YY` on hover. A summary insight strip below the chart lists total spend for the range plus the top 3 projects by cost, using the same `overageCostPerCredit` rate as the AIC billing card.
+
+### Fixed
+
+- **Sidebar Breakdown value overflow.** `.bar-row` grid was `90px 1fr auto` — the fixed 90px label + `min-width: 60px` value column together pushed numbers past the sidebar right edge on narrow sidebars, clipping values like `23,712` to `23,7`. Changed to `minmax(0, 1fr) minmax(16px, 56px) auto` with `min-width: 0` on labels/tracks/card and `white-space: nowrap` + `padding-left: 4px` on values. Numbers now show fully at any sidebar width; labels truncate cleanly with existing ellipsis.
+
 ## [1.10.33] - 2026-07-29
 
 ### Fixed

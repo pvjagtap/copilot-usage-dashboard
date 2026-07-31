@@ -356,26 +356,29 @@ body {
 /* ── Bars (horizontal) ───────────────────────────────────── */
 .bar-row {
   display: grid;
-  grid-template-columns: 90px 1fr auto;
+  grid-template-columns: minmax(0, 1fr) minmax(16px, 56px) auto;
   align-items: center;
   gap: 6px;
   font-size: 11px;
   padding: 2px 0;
+  min-width: 0;
 }
-.bar-row .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-row .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .bar-track {
   height: 6px;
   background: var(--vscode-progressBar-background, #2b2b2b);
   border-radius: 3px;
   overflow: hidden;
   opacity: 0.4;
+  min-width: 0;
 }
 .bar-fill {
   height: 100%;
   background: var(--vscode-charts-blue, #4da3ff);
   border-radius: 3px;
 }
-.bar-row .value { font-variant-numeric: tabular-nums; text-align: right; min-width: 60px; }
+.bar-row .value { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; padding-left: 4px; }
+.card { min-width: 0; }
 
 /* ── Pace progress (with overage state) ──────────────────── */
 .pace-bar {
