@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.73] - 2026-08-02
+
+### Changed
+
+- **All Sessions table — new `Cost` column and compressed `Summary` cell.** Each session now shows its cost as `$X.XX` (computed from `aicCredits × overageCostPerCredit`, same rate the hero uses), placed right after `AI Credits`. Summary cell was capped at `max-width: 260px` with single-line ellipsis on both title (≤60 chars) and prompt preview (≤80 chars); the full untruncated text is preserved on the cell's `title` attribute, so hovering still reveals everything. Font sizes dropped to 12/11 px and margins tightened to keep rows visually compact.
+
 ## [1.10.72] - 2026-08-02
 
 ### Changed

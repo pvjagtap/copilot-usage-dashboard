@@ -216,9 +216,10 @@ td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .mult-1 { background: transparent; color: var(--blue); }
 .mult-low { background: transparent; color: var(--green); }
 .mult-high { background: var(--mult-high-bg); color: var(--orange); border: 1px solid var(--mult-high-border); }
-.summary-cell .title { font-weight: 700; font-size: 13px; }
-.summary-cell .preview { color: var(--muted); font-size: 12px; margin-top: 2px; font-weight: 500; }
-.summary-cell .tags { margin-top: 3px; }
+.summary-cell { max-width: 260px; }
+.summary-cell .title { font-weight: 700; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.summary-cell .preview { color: var(--muted); font-size: 11px; margin-top: 1px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.summary-cell .tags { margin-top: 2px; }
 .sessions-scroll { max-height: 600px; overflow-y: auto; }
 .sessions-scroll::-webkit-scrollbar { width: 6px; }
 .sessions-scroll::-webkit-scrollbar-track { background: var(--bg); }
@@ -1428,24 +1429,32 @@ function renderToolBar(tools) {
 function renderSessions(sessions, subs) {
   const el = document.getElementById('sessions-section');
   if (!sessions.length) { el.innerHTML=''; return; }
+  const rate = (DATA.aicSummary && DATA.aicSummary.config && DATA.aicSummary.config.overageCostPerCredit) || 0.01;
   const sm={};
   subs.forEach(s=>{if(!sm[s.sessionId])sm[s.sessionId]={};sm[s.sessionId][s.agentName]=(sm[s.sessionId][s.agentName]||0)+s.count;});
+  const trunc=(str,n)=>{ if(!str) return ''; const t=String(str).replace(/\s+/g,' ').trim(); return t.length>n ? t.slice(0,n-1)+'\u2026' : t; };
   let rows='';
   sessions.forEach(s=>{
     const mult=getMult(s.modelName,s.multiplier);
     const sd=sm[s.sessionId]?Object.entries(sm[s.sessionId]).map(([a,c])=>'<span class="pill">'+esc(a)+' x'+c+'</span>').join(' '):'';
     const ap=s.agentId?'<span class="pill pill-green">'+esc(s.agentId)+'</span>':'';
     const bp=s.account?'<span class="pill pill-blue">'+esc(s.account)+'</span>':'';
-    const sum='<div class="summary-cell">'+(s.title?'<div class="title">'+esc(s.title)+'</div>':'')+(s.promptPreview?'<div class="preview">'+esc(s.promptPreview)+'</div>':'')+'<div class="tags">'+ap+' '+bp+'</div></div>';
+    const titleFull=s.title||'';
+    const previewFull=s.promptPreview||'';
+    const titleShort=trunc(titleFull,60);
+    const previewShort=trunc(previewFull,80);
+    const sumTooltip=esc([titleFull,previewFull].filter(Boolean).join(' \u2014 '));
+    const sum='<div class="summary-cell" title="'+sumTooltip+'">'+(titleShort?'<div class="title">'+esc(titleShort)+'</div>':'')+(previewShort?'<div class="preview">'+esc(previewShort)+'</div>':'')+'<div class="tags">'+ap+' '+bp+'</div></div>';
     const fl=(s.sourcePaths||[]).map((p,i)=>'<span class="file-link" data-path="'+esc(p)+'" title="'+esc(p)+'">log '+(i+1)+'</span>').join('')
       +(s.transcriptPaths||[]).map((p,i)=>'<span class="file-link" data-path="'+esc(p)+'" title="'+esc(p)+'">transcript '+(i+1)+'</span>').join('');
     const flDiv=fl?'<div class="file-links">'+fl+'</div>':'';
     // Cache % is pre-computed in dashboardData.ts (see cache.ts). Webview
     // never inlines the arithmetic — one source of truth for the formula.
     const cacheCell=s.actualPrompt>0?'<td class="num cached">'+(s.cacheHitPct||0).toFixed(1)+'%</td>':'<td class="num">—</td>';
-    rows+='<tr><td style="font-family:monospace;font-size:11px">'+esc(s.sessionShort)+'...</td><td>'+esc(s.project)+'</td><td>'+sum+'</td><td style="font-size:11px">'+esc(s.last)+'</td><td class="num">'+s.durationMin+'m</td><td><span class="model-tag '+mc(s.modelName)+'">'+esc(s.modelName)+'</span>'+mbadge(mult)+'</td><td class="num">'+s.turns+'</td><td class="num">'+fmt(s.actualPrompt||s.prompt)+'</td><td class="num">'+fmt(s.actualOutput||s.output)+'</td>'+cacheCell+'<td class="num">'+fmt(s.toolCalls)+'</td><td class="num">'+(s.subagents||'')+(sd?' '+sd:'')+'</td><td class="num">'+(s.aicCredits?s.aicCredits.toFixed(1):'—')+'</td><td>'+flDiv+'</td></tr>';
+    const costCell=s.aicCredits?'<td class="num orange">$'+(s.aicCredits*rate).toFixed(2)+'</td>':'<td class="num">—</td>';
+    rows+='<tr><td style="font-family:monospace;font-size:11px">'+esc(s.sessionShort)+'...</td><td>'+esc(s.project)+'</td><td>'+sum+'</td><td style="font-size:11px">'+esc(s.last)+'</td><td class="num">'+s.durationMin+'m</td><td><span class="model-tag '+mc(s.modelName)+'">'+esc(s.modelName)+'</span>'+mbadge(mult)+'</td><td class="num">'+s.turns+'</td><td class="num">'+fmt(s.actualPrompt||s.prompt)+'</td><td class="num">'+fmt(s.actualOutput||s.output)+'</td>'+cacheCell+'<td class="num">'+fmt(s.toolCalls)+'</td><td class="num">'+(s.subagents||'')+(sd?' '+sd:'')+'</td><td class="num">'+(s.aicCredits?s.aicCredits.toFixed(1):'—')+'</td>'+costCell+'<td>'+flDiv+'</td></tr>';
   });
-  el.innerHTML='<div class="table-card"><div class="section-title">All Sessions &mdash; '+sessions.length+' shown</div><div class="sessions-scroll table-scroll"><table><thead><tr><th>Session</th><th>Project</th><th>Summary</th><th>Last Active</th><th class="num">Duration</th><th>Model</th><th class="num">Turns</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Cache %</th><th class="num">Tools</th><th class="num">Subagents</th><th class="num">AI Credits</th><th>Files</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+  el.innerHTML='<div class="table-card"><div class="section-title">All Sessions &mdash; '+sessions.length+' shown</div><div class="sessions-scroll table-scroll"><table><thead><tr><th>Session</th><th>Project</th><th>Summary</th><th>Last Active</th><th class="num">Duration</th><th>Model</th><th class="num">Turns</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Cache %</th><th class="num">Tools</th><th class="num">Subagents</th><th class="num">AI Credits</th><th class="num">Cost</th><th>Files</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
   el.querySelectorAll('.file-link[data-path]').forEach(link => {
     link.addEventListener('click', () => { vscode.postMessage({type:'openFile',path:link.dataset.path}); });
   });
