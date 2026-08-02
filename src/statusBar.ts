@@ -268,19 +268,22 @@ export class StatusBarProvider {
     // legend never grows to include stale versions like `claude-opus-4.6`
     // when the user is on `claude-opus-4.7` today.
     if (data?.ranges) {
-      const legend = buildActiveModelLegend(otel, cs);
+      const legend = buildActiveModelLegend(otel, cs, data.ranges.daily);
       md.push(
         `| DAILY | WEEKLY | THIS MONTH |`,
         `|:-:|:-:|:-:|`,
         `| ${periodDonutMd(data.ranges.daily, legend, dpc)} | ${periodDonutMd(data.ranges.weekly, legend, dpc)} | ${periodDonutMd(data.ranges.month, legend, dpc)} |`,
       );
       if (legend.length > 0) {
+        // Each cell is nowrap so the ● stays glued to its model name; the ` · `
+        // separators are regular spaces so the browser wraps between cells
+        // when the row would exceed the tooltip's ~220 px width.
         const legendCells = legend
-          .map((l) => `<span style="color:${l.color}">●</span> ${escapeMd(l.model)}`)
-          .join(" &nbsp;·&nbsp; ");
+          .map((l) => `<span style="white-space:nowrap"><span style="color:${l.color}">●</span> ${escapeMd(l.model)}</span>`)
+          .join(" · ");
         md.push("");
         md.push(
-          `<span style="color:${COL.muted}">${legendCells} &nbsp;·&nbsp; <span style="color:${COL.accent2}">●</span> other</span>`
+          `<span style="color:${COL.muted}">${legendCells} · <span style="white-space:nowrap"><span style="color:${COL.accent2}">●</span> other</span></span>`
         );
       }
       md.push("");
@@ -677,7 +680,8 @@ function fmtTokens(n: number): string {
  */
 function buildActiveModelLegend(
   otel: LiveStats | null | undefined,
-  cs: CurrentSessionInfo | null | undefined
+  cs: CurrentSessionInfo | null | undefined,
+  rangeFallback?: PeriodStats
 ): Array<{ model: string; color: string }> {
   const active = new Map<string, number>();
   if (otel && otel.byModel.size > 0) {
@@ -692,6 +696,16 @@ function buildActiveModelLegend(
   // this window to, so idle-OTel sessions still get a legend entry.
   if (active.size === 0 && cs && cs.model) {
     active.set(cs.model, cs.prompt + cs.output);
+  }
+  // Last-ditch fallback: seed from the DAILY period byModel so the donuts
+  // still render colored slices when OTel is silent AND cs has not built yet.
+  // Only the TOP model wins — the rest fold into "other" so the legend
+  // stays a single "currently active" name, not a historical list.
+  if (active.size === 0 && rangeFallback) {
+    const top = rangeFallback.byModel.find((m) => m.tokens > 0);
+    if (top) {
+      active.set(top.model, top.tokens);
+    }
   }
   const sorted = [...active.entries()]
     .sort((a, b) => b[1] - a[1])

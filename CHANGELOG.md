@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.72] - 2026-08-02
+
+### Changed
+
+- **Legend under the period donuts is now a single currently-active model.** The 1.10.70 last-ditch fallback seeded the legend from every entry in `data.ranges.daily.byModel`, so idle-OTel + unbuilt-cs sessions listed historical models like `claude-haiku-4.5` / `gpt-5.6-sol` alongside `claude-opus-4.7`. Fallback now takes only the top model from the daily range; everything else folds into the neutral "other" grey, matching the same "currently active" scope the OTel and cs paths already use.
+
+## [1.10.71] - 2026-08-02
+
+### Fixed
+
+- **Model legend under the period donuts overflowed the tooltip width.** The cells were joined with `&nbsp;·&nbsp;` (non-breaking) so nothing in the row could wrap; long legends stretched the hover well past 220 px. Each cell is now wrapped in a `white-space:nowrap` span (keeps the colored bullet glued to its model name), and the separators are plain ` · ` so the row can break between cells and flow onto multiple lines when needed.
+
+## [1.10.70] - 2026-08-02
+
+### Fixed
+
+- **Period donuts (DAILY / WEEKLY / THIS MONTH) rendered as solid grey with no legend when OTel was silent and the debug-log `currentSession` had not built yet.** `buildActiveModelLegend` had two sources (`otel.byModel`, `cs.model`); with both empty the legend was empty, so every slice folded into the neutral "other" grey and no color-key was shown. Added a last-ditch fallback that seeds the legend from `data.ranges.daily.byModel`, so the donuts stay colored (and a legend row appears) whenever there is any period activity to show.
+
 ## [1.10.69] - 2026-08-02
 
 ### Fixed
