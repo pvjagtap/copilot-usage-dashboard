@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.69] - 2026-08-02
+
+### Fixed
+
+- **Status-bar item stuck on the idle `$(dashboard)` icon even when the sidebar showed a live Session AIC for this window.** The idle-vs-active gate in `updateStatus` only checked `otel.requests > 0` and `currentSession`. When the OTLP receiver on port 14318 is held by another VS Code window (see the dashboard's Live OpenTelemetry warning), `otel` is empty here; if the debug-log-derived `currentSession` metadata also hasn't finished building yet, the item fell through to the idle branch even though `data.currentSessionAIC` was non-zero. Gate now also lets `currentSessionAIC > 0` promote to active, so the item renders `$(zap) $X.XX` in lock-step with the sidebar.
+
+## [1.10.68] - 2026-08-02
+
+### Fixed
+
+- **Status-bar Snapshot `Tool calls` was hardcoded to 0.** Both the OTel path and the debug-log fallback in `updateStatusBar` set `toolCalls: 0` inline. Now the count is derived from `scan.toolCalls` filtered by the `(sessionId, turnIndex)` pairs of turns active in this VS Code window (post-activation, on-or-after AIC start) — the same instance-scope rule used for tokens and credits — and shared between both paths so the value never depends on which data source rendered first.
+
 ## [1.10.67] - 2026-08-02
 
 ### Changed

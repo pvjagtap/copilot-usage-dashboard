@@ -835,6 +835,24 @@ function updateStatusBar(): void {
   // duration). The `aicCredits` field is filled from `currentSessionAIC`
   // above — no credit math happens in this block.
   let currentSession: CurrentSessionInfo | null = null;
+  // Turns active in THIS VS Code window (post-activation, on-or-after AIC start).
+  const instanceTurns = lastScan
+    ? lastScan.turns.filter(
+        t => t.timestamp && t.timestamp >= activationTime && t.timestamp.slice(0, 10) >= AIC_START
+      )
+    : [];
+  // Count tool calls scoped to those turns via (sessionId, turnIndex) match.
+  // Shared by both the OTel and debug-log paths so the value never depends
+  // on which data source rendered first.
+  let instanceToolCalls = 0;
+  if (lastScan && instanceTurns.length > 0) {
+    const turnKeys = new Set(instanceTurns.map(t => `${t.sessionId}|${t.turnIndex}`));
+    for (const tc of lastScan.toolCalls) {
+      if (turnKeys.has(`${tc.sessionId}|${tc.turnIndex}`)) {
+        instanceToolCalls++;
+      }
+    }
+  }
   if (otel && otel.requests > 0) {
     let otelPrompt = 0;
     let otelOutput = 0;
@@ -855,47 +873,39 @@ function updateStatusBar(): void {
       turns: otel.requests,
       prompt: otelPrompt,
       output: otelOutput,
-      toolCalls: 0,
+      toolCalls: instanceToolCalls,
       durationMin: computeWindowDurationMin(),
       aicCredits: currentSessionAIC,
     };
-  } else if (lastScan && lastScan.turns.length > 0) {
-    // No live OTel — use scanner turns that arrived AFTER this extension activated.
-    // This scopes "current" to this VS Code instance even when reading shared storage.
-    const instanceTurns = lastScan.turns.filter(
-      t => t.timestamp && t.timestamp >= activationTime && t.timestamp.slice(0, 10) >= AIC_START
-    );
+  } else if (lastScan && instanceTurns.length > 0) {
+    let instancePrompt = 0;
+    let instanceOutput = 0;
+    const modelTokens = new Map<string, number>();
 
-    if (instanceTurns.length > 0) {
-      let instancePrompt = 0;
-      let instanceOutput = 0;
-      const modelTokens = new Map<string, number>();
-
-      for (const t of instanceTurns) {
-        instancePrompt += t.debugPromptTokens || t.promptTokens;
-        instanceOutput += t.debugOutputTokens || t.outputTokens;
-        const m = t.modelFamily || "unknown";
-        modelTokens.set(
-          m,
-          (modelTokens.get(m) ?? 0) +
-            (t.debugPromptTokens || t.promptTokens) +
-            (t.debugOutputTokens || t.outputTokens)
-        );
-      }
-
-      const topModel = [...modelTokens.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "unknown";
-      currentSession = {
-        sessionId: "instance",
-        sessionShort: "instance",
-        model: topModel,
-        turns: instanceTurns.length,
-        prompt: instancePrompt,
-        output: instanceOutput,
-        toolCalls: 0,
-        durationMin: computeWindowDurationMin(),
-        aicCredits: currentSessionAIC,
-      };
+    for (const t of instanceTurns) {
+      instancePrompt += t.debugPromptTokens || t.promptTokens;
+      instanceOutput += t.debugOutputTokens || t.outputTokens;
+      const m = t.modelFamily || "unknown";
+      modelTokens.set(
+        m,
+        (modelTokens.get(m) ?? 0) +
+          (t.debugPromptTokens || t.promptTokens) +
+          (t.debugOutputTokens || t.outputTokens)
+      );
     }
+
+    const topModel = [...modelTokens.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "unknown";
+    currentSession = {
+      sessionId: "instance",
+      sessionShort: "instance",
+      model: topModel,
+      turns: instanceTurns.length,
+      prompt: instancePrompt,
+      output: instanceOutput,
+      toolCalls: instanceToolCalls,
+      durationMin: computeWindowDurationMin(),
+      aicCredits: currentSessionAIC,
+    };
   }
 
   statusBar.updateStatus({

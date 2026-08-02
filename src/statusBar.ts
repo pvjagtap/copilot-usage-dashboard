@@ -172,16 +172,15 @@ export class StatusBarProvider {
     this.applyLimitTheme(dl);
     const limitPrefix = this.limitPrefix(dl);
 
-    // Idle — nothing seen yet for this instance.
-    if (!hasOtel && !cs) {
+    // Any AIC seen for this window (OTel, cs, or the dashData overlay) means active.
+    const sessionAIC = data?.currentSessionAIC ?? cs?.aicCredits ?? 0;
+    if (!hasOtel && !cs && sessionAIC <= 0) {
       this.item.text = `${limitPrefix}$(dashboard)`;
       this.lastRenderedText = this.item.text;
       this.item.tooltip = this.buildTooltipForIdle(dl);
       return;
     }
 
-    // Resolve session-total AIC (OTel calculator value wins; debug-log fallback otherwise).
-    const sessionAIC = data?.currentSessionAIC ?? cs?.aicCredits ?? 0;
     const sessionDollars = sessionAIC * dpc;
     const lastReqAIC = data?.lastRequestAIC ?? 0;
 
