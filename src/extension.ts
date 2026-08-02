@@ -20,6 +20,7 @@ import { Enforcement } from "./enforcement";
 import { HookManager } from "./hookManager";
 import { detectAndApplyPlan, resetPlanDetection } from "./planDetector";
 import { loadCatalog as loadModelCatalog } from "./modelCatalog";
+import { computeCacheHit } from "./cache";
 
 const OTEL_PORT = 14318;
 /**
@@ -703,6 +704,102 @@ function computeWindowDurationMin(): number {
   return Math.max(0, Math.round(ms / 60_000));
 }
 
+/**
+ * Aggregate DAILY / WEEKLY / THIS-MONTH AIC + per-model token breakdowns for
+ * the status-bar tooltip's donut row. All values come straight from
+ * `dashData` — no independent bookkeeping. Per-model token shares within a
+ * period drive the donut arcs (token-share ≈ cost-share within a period).
+ */
+function computeStatusBarRanges(dashData: DashboardData): {
+  daily: { aic: number; tokens: number; byModel: Array<{ model: string; tokens: number }> };
+  weekly: { aic: number; tokens: number; byModel: Array<{ model: string; tokens: number }> };
+  month: { aic: number; tokens: number; byModel: Array<{ model: string; tokens: number }> };
+} {
+  const today = new Date().toISOString().slice(0, 10);
+  const week = new Date();
+  week.setDate(week.getDate() - 6);
+  const weekStart = week.toISOString().slice(0, 10);
+  // THIS MONTH = current calendar month (first day of the month through
+  // today), NOT a 30-day rolling window. Users expect the "This Month"
+  // label to mean the current month on the calendar.
+  const nowMonth = new Date();
+  const monthStart = new Date(nowMonth.getFullYear(), nowMonth.getMonth(), 1)
+    .toISOString()
+    .slice(0, 10);
+
+  let dailyAic = 0;
+  let weeklyAic = 0;
+  let monthAic = 0;
+  for (const row of dashData.aicSummary.byDay) {
+    if (row.day === today) {
+      dailyAic += row.credits;
+    }
+    if (row.day >= weekStart && row.day <= today) {
+      weeklyAic += row.credits;
+    }
+    if (row.day >= monthStart && row.day <= today) {
+      monthAic += row.credits;
+    }
+  }
+
+  const dailyModelMap = new Map<string, number>();
+  const weeklyModelMap = new Map<string, number>();
+  const monthModelMap = new Map<string, number>();
+  let dailyTokens = 0;
+  let weeklyTokens = 0;
+  let monthTokens = 0;
+  for (const d of dashData.dailyByModel) {
+    const tk = d.prompt + d.output;
+    if (d.day === today) {
+      dailyTokens += tk;
+      dailyModelMap.set(d.model, (dailyModelMap.get(d.model) ?? 0) + tk);
+    }
+    if (d.day >= weekStart && d.day <= today) {
+      weeklyTokens += tk;
+      weeklyModelMap.set(d.model, (weeklyModelMap.get(d.model) ?? 0) + tk);
+    }
+    if (d.day >= monthStart && d.day <= today) {
+      monthTokens += tk;
+      monthModelMap.set(d.model, (monthModelMap.get(d.model) ?? 0) + tk);
+    }
+  }
+
+  const toArr = (m: Map<string, number>) =>
+    [...m.entries()]
+      .map(([model, tokens]) => ({ model, tokens }))
+      .sort((a, b) => b.tokens - a.tokens);
+
+  return {
+    daily: { aic: dailyAic, tokens: dailyTokens, byModel: toArr(dailyModelMap) },
+    weekly: { aic: weeklyAic, tokens: weeklyTokens, byModel: toArr(weeklyModelMap) },
+    month: { aic: monthAic, tokens: monthTokens, byModel: toArr(monthModelMap) },
+  };
+}
+
+/**
+ * Cycle-wide cache-hit % across every session whose lastDate lies in the
+ * current billing cycle. Formula lives in cache.ts (single source of truth).
+ * Returns undefined when there is no prompt data in the cycle (idle
+ * workspace or pre-AIC period).
+ */
+function computeCycleCacheHit(dashData: DashboardData): number | undefined {
+  const start = dashData.aicSummary.billingCycleStart;
+  const end = dashData.aicSummary.billingCycleEnd;
+  let prompt = 0;
+  let cached = 0;
+  for (const s of dashData.sessionsAll) {
+    if (!s.lastDate || s.lastDate < start || s.lastDate > end) {
+      continue;
+    }
+    prompt += s.actualPrompt || s.prompt || 0;
+    cached += s.actualCached || 0;
+  }
+  if (prompt <= 0) {
+    return undefined;
+  }
+  return computeCacheHit(prompt, cached).pct;
+}
+
 function updateStatusBar(): void {
   if (!statusBar) {
     return;
@@ -811,6 +908,10 @@ function updateStatusBar(): void {
     informationalAIC,
     dailyLimit: computeAndPushDailyLimit(calculator),
     dollarPerCredit: aicConfig.overageCostPerCredit ?? 0.01,
+    ranges: computeStatusBarRanges(dashData),
+    cycleCacheHitPct: computeCycleCacheHit(dashData),
+    liveSessionPrompt: dashData.liveOtel.prompt,
+    liveSessionCached: dashData.liveOtel.cached,
   });
 
   // Stash current-session metadata for the sidebar (model / turns / duration).

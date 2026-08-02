@@ -184,6 +184,12 @@ export interface ModelCatalogEntry {
     cacheWriteCreditsPerMillion: number;
   };
   /**
+   * Maximum input tokens the model accepts, sourced from CAPI's
+   * `billing.token_prices.long_context.context_max` (preferred, real ceiling)
+   * with `default.context_max` fallback. Undefined when CAPI omits it.
+   */
+  contextMax?: number;
+  /**
    *  • `"capi"`        — entry came from the Copilot CAPI `/models` response.
    *                       `billable === (multiplier > 0)`.
    *  • `"user-config"` — entry was synthesised from the user's local
@@ -289,6 +295,32 @@ function extractRatesFromCapi(m: CapiModelResponse): ModelCatalogEntry["rates"] 
     cachedInputCreditsPerMillion: def.cache_price ?? 0,
     cacheWriteCreditsPerMillion: def.cache_write_price ?? 0,
   };
+}
+
+/**
+ * True maximum input tokens for the model — prefer `long_context.context_max`
+ * (the actual ceiling used when the client opts into extended context, e.g.
+ * Claude's 1M mode), fall back to `default.context_max` (the standard tier).
+ * Undefined when CAPI omits it, which happens for some legacy / preview models.
+ */
+function extractContextMaxFromCapi(m: CapiModelResponse): number | undefined {
+  const long = m.billing?.token_prices?.long_context?.context_max;
+  const def = m.billing?.token_prices?.default?.context_max;
+  return long ?? def;
+}
+
+/**
+ * Public lookup of a model's context_max, tolerant to id shape variance
+ * between CAPI (`claude-opus-4.7`) and OTel (`claude-opus-4-7`, etc.).
+ * Returns undefined when the catalog is not yet loaded or the model has
+ * no reported context_max.
+ */
+export function getContextMaxFor(modelId: string): number | undefined {
+  const cached = getCachedCatalog();
+  if (!cached || !modelId) return undefined;
+  const dotForm = modelId.toLowerCase().replace(/(\d)-(\d)/g, "$1.$2");
+  const entry = cached.byId.get(dotForm) ?? cached.byId.get(modelId.toLowerCase());
+  return entry?.contextMax;
 }
 
 /**
@@ -471,6 +503,7 @@ async function refreshFromNetwork(ctx: vscode.ExtensionContext, log: LogFn): Pro
         preview: m.preview ?? false,
         vendor: m.vendor,
         rates,
+        contextMax: extractContextMaxFromCapi(m),
         source: "capi",
       });
     }

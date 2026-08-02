@@ -164,13 +164,15 @@ h1 svg { width: 22px; height: 22px; }
 .section-title { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--fg); margin-bottom: 8px; }
 .section-subtitle { font-size: 13px; color: var(--green); font-weight: 500; }
 table { width: 100%; border-collapse: collapse; }
-th { text-align: left; font-size: 11px; text-transform: uppercase; color: var(--muted); font-weight: 700; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+th { text-align: left; font-size: 11px; text-transform: uppercase; color: var(--muted); font-weight: 700; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.table-scroll { overflow-x: auto; overflow-y: hidden; }
+.table-scroll table { min-width: 100%; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .source-usage table th { font-size: 12px; padding: 8px 10px; }
 .source-usage table td { font-size: 13px; padding: 10px; }
 .source-usage .section-title { font-size: 15px; }
 .source-usage .section-subtitle { font-size: 12px; }
-.num { text-align: right; font-variant-numeric: tabular-nums; }
 .model-tag { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 500; display: inline-block; }
 .model-opus { background: var(--model-opus-bg); color: var(--model-opus-fg); border: 1px solid var(--model-opus-border); }
 .model-sonnet { background: var(--model-sonnet-bg); color: var(--model-sonnet-fg); border: 1px solid var(--model-sonnet-border); }
@@ -614,6 +616,7 @@ function render() {
     turns: sessions.reduce((s,x)=>s+x.turns,0),
     prompt: sessions.reduce((s,x)=>s+(x.actualPrompt||x.prompt),0),
     output: sessions.reduce((s,x)=>s+(x.actualOutput||x.output),0),
+    cached: sessions.reduce((s,x)=>s+(x.actualCached||0),0),
     tools: tools.reduce((s,x)=>s+x.count,0),
     subs: subs.reduce((s,x)=>s+x.count,0),
     premium: sessions.reduce((s,x)=>s+getMult(x.modelName,x.multiplier)*x.turns,0),
@@ -709,6 +712,15 @@ function render() {
   document.getElementById('hero-stats').innerHTML = [
     {l:'AI Credits Spent', v:aicTotal,                              sub: rl + ' · ' + t.sessions + ' sessions · ' + t.turns + ' turns', accent:'orange', delta:spendDelta},
     {l:overageLabel,       v:'$'+rangeOverageDollars.toFixed(2),    sub: overageSub, accent:'red', delta:''},
+    // Cache Hit formula MUST match cache.ts (single source of truth). The
+    // arithmetic is inlined here only because the aggregate is built from a
+    // user-selected range at render time — extension host can't pre-compute
+    // every possible range. Formula: cached / prompt (Copilot's prompt
+    // already includes cached — see aicCredits.ts:452). Tiers: ≥80 excellent,
+    // ≥30 ok, else cold.
+    {l:'Cache Hit',        v:(t.prompt>0?(t.cached/t.prompt*100).toFixed(1)+'%':'—'),
+                                                                     sub: (t.cached>0?fmt(t.cached)+' cached / '+fmt(t.prompt)+' prompt':'no cache data'),
+                                                                     accent:'green', delta:''},
     {l:'Daily Pace',       v:Math.round(heroDailyAvg).toLocaleString(), sub: paceSub, accent:'', delta:'<span class="h-delta up">'+turnsPerSess+' turns/sess · '+tokensPerTurn+' tok/turn</span>'},
     {l:'Projected',        v:projectedValue,                        sub: projectedSub, accent:projectedAccent, delta:''},
   ].map(c=>'<div class="hero-card'+(c.accent?' accent-'+c.accent:'')+'"><div class="h-label">'+c.l+'</div><div class="h-value">'+c.v+'</div><div class="h-sub">'+c.sub+'</div>'+(c.delta||'')+'</div>').join('');
@@ -766,10 +778,12 @@ function renderOtel(live) {
   let rows = '';
   (live.byModel||[]).forEach(m => {
     const aic = (m.aicCredits || 0);
+    // Hit rate is pre-computed in dashboardData.ts (see cache.ts).
+    const hit = m.prompt > 0 ? (m.cacheHitPct || 0).toFixed(1) + '%' : '—';
     // 2dp matches the storage precision (copilotUsageNanoAiu / 1e9 rounded to
     // 2dp by dashboardData.ts); .toFixed(1) was silently hiding cents — e.g. a
     // 7.22-credit request rendered as 7.2.
-    rows += '<tr><td><span class="model-tag '+mc(m.model)+'">'+esc(m.model)+'</span></td><td class="num">'+m.requests+'</td><td class="num">'+fmt(m.prompt)+'</td><td class="num">'+fmt(m.completion)+'</td><td class="num">'+fmt(m.traceCached)+'</td><td class="num">'+fmt(m.metricCached)+'</td><td class="num cached">'+fmt(m.cached)+'</td><td class="num orange">'+aic.toFixed(2)+'</td></tr>';
+    rows += '<tr><td><span class="model-tag '+mc(m.model)+'">'+esc(m.model)+'</span></td><td class="num">'+m.requests+'</td><td class="num">'+fmt(m.prompt)+'</td><td class="num">'+fmt(m.completion)+'</td><td class="num">'+fmt(m.traceCached)+'</td><td class="num">'+fmt(m.metricCached)+'</td><td class="num cached">'+fmt(m.cached)+'</td><td class="num cached">'+hit+'</td><td class="num orange">'+aic.toFixed(2)+'</td></tr>';
   });
   // AIC (sess) sub-text: when the classifier excluded non-billable byModel
   // rows (Ollama / BYOK / unknown), show their sum so the user can SEE the
@@ -778,14 +792,19 @@ function renderOtel(live) {
   // visible "AIC SESS = 0.00 but rows show 70.96" bug).
   const infoAic = +(live.informationalAIC || 0);
   const sessSub = infoAic > 0 ? 'session total · +' + infoAic.toFixed(2) + ' informational' : 'session total';
+  // Cache-hit rate — pre-computed in dashboardData.ts. Tier thresholds match
+  // cache.ts (excellent ≥ 80, ok ≥ 30). Never inline the arithmetic here —
+  // it must stay in one place to prevent surface-to-surface drift.
+  const hitPct = live.cacheHitPct || 0;
+  const hitSub = hitPct >= 80 ? 'excellent reuse' : hitPct >= 30 ? 'some reuse' : 'cold cache';
   el.innerHTML = '<div class="table-card"><div class="section-head"><div class="section-title">Live OpenTelemetry</div><div class="section-subtitle">'+esc(sourceLabel)+' • Last event '+esc(ls)+'</div></div>'
     +'<div class="note">'+(live.source === 'debug-log' ? debugNote : 'Live OTLP export. Cached tokens prefer cumulative metric deltas when available.')+'</div>'
     +'<div class="stats-row">'
-    +[reqLabel+':'+live.requests+':last event '+esc(ls),'Live Prompt:'+fmt(live.prompt)+':from traces','Live Output:'+fmt(live.completion)+':from traces','Live Cached:'+fmt(live.cached)+':'+csub,'Trace Cache:'+fmt(live.traceCached)+':cache_read','Metric Cache:'+fmt(live.metricCached)+':token.usage','AIC (sess):'+((live.sessionAIC||0).toFixed(2))+':'+sessSub,'AIC (last req):'+ ((live.lastRequestAIC||0).toFixed(2))+':last request']
-      .map((s,i)=>{const p=s.split(':');return '<div class="stat-card"><div class="label">'+p[0]+'</div><div class="value'+(i===3?' cached':i>=6?' orange':'')+'">'+p[1]+'</div><div class="sub">'+p[2]+'</div></div>';}).join('')
+    +[reqLabel+':'+live.requests+':last event '+esc(ls),'Live Prompt:'+fmt(live.prompt)+':from traces','Live Output:'+fmt(live.completion)+':from traces','Live Cached:'+fmt(live.cached)+':'+csub,'Cache Hit:'+hitPct.toFixed(1)+'%:'+hitSub,'Trace Cache:'+fmt(live.traceCached)+':cache_read','Metric Cache:'+fmt(live.metricCached)+':token.usage','AIC (sess):'+((live.sessionAIC||0).toFixed(2))+':'+sessSub,'AIC (last req):'+ ((live.lastRequestAIC||0).toFixed(2))+':last request']
+      .map((s,i)=>{const p=s.split(':');return '<div class="stat-card"><div class="label">'+p[0]+'</div><div class="value'+(i===3||i===4?' cached':i>=7?' orange':'')+'">'+p[1]+'</div><div class="sub">'+p[2]+'</div></div>';}).join('')
     +'</div>'
     +'<div class="section-title" style="margin-top:8px">Live OTel by Model</div>'
-    +'<table><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Trace Cache</th><th class="num">Metric Cache</th><th class="num">Effective Cache</th><th class="num">AIC</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+    +'<div class="table-scroll"><table><thead><tr><th>Model</th><th class="num">Reqs</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Trace</th><th class="num">Metric</th><th class="num">Cached</th><th class="num">Hit %</th><th class="num">AIC</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
 }
 
 /**
@@ -1421,9 +1440,12 @@ function renderSessions(sessions, subs) {
     const fl=(s.sourcePaths||[]).map((p,i)=>'<span class="file-link" data-path="'+esc(p)+'" title="'+esc(p)+'">log '+(i+1)+'</span>').join('')
       +(s.transcriptPaths||[]).map((p,i)=>'<span class="file-link" data-path="'+esc(p)+'" title="'+esc(p)+'">transcript '+(i+1)+'</span>').join('');
     const flDiv=fl?'<div class="file-links">'+fl+'</div>':'';
-    rows+='<tr><td style="font-family:monospace;font-size:11px">'+esc(s.sessionShort)+'...</td><td>'+esc(s.project)+'</td><td>'+sum+'</td><td style="font-size:11px">'+esc(s.last)+'</td><td class="num">'+s.durationMin+'m</td><td><span class="model-tag '+mc(s.modelName)+'">'+esc(s.modelName)+'</span>'+mbadge(mult)+'</td><td class="num">'+s.turns+'</td><td class="num">'+fmt(s.actualPrompt||s.prompt)+'</td><td class="num">'+fmt(s.actualOutput||s.output)+'</td><td class="num">'+fmt(s.toolCalls)+'</td><td class="num">'+(s.subagents||'')+(sd?' '+sd:'')+'</td><td class="num">'+(s.aicCredits?s.aicCredits.toFixed(1):'—')+'</td><td>'+flDiv+'</td></tr>';
+    // Cache % is pre-computed in dashboardData.ts (see cache.ts). Webview
+    // never inlines the arithmetic — one source of truth for the formula.
+    const cacheCell=s.actualPrompt>0?'<td class="num cached">'+(s.cacheHitPct||0).toFixed(1)+'%</td>':'<td class="num">—</td>';
+    rows+='<tr><td style="font-family:monospace;font-size:11px">'+esc(s.sessionShort)+'...</td><td>'+esc(s.project)+'</td><td>'+sum+'</td><td style="font-size:11px">'+esc(s.last)+'</td><td class="num">'+s.durationMin+'m</td><td><span class="model-tag '+mc(s.modelName)+'">'+esc(s.modelName)+'</span>'+mbadge(mult)+'</td><td class="num">'+s.turns+'</td><td class="num">'+fmt(s.actualPrompt||s.prompt)+'</td><td class="num">'+fmt(s.actualOutput||s.output)+'</td>'+cacheCell+'<td class="num">'+fmt(s.toolCalls)+'</td><td class="num">'+(s.subagents||'')+(sd?' '+sd:'')+'</td><td class="num">'+(s.aicCredits?s.aicCredits.toFixed(1):'—')+'</td><td>'+flDiv+'</td></tr>';
   });
-  el.innerHTML='<div class="table-card"><div class="section-title">All Sessions &mdash; '+sessions.length+' shown</div><div class="sessions-scroll"><table><thead><tr><th>Session</th><th>Project</th><th>Summary</th><th>Last Active</th><th class="num">Duration</th><th>Model</th><th class="num">Turns</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Tools</th><th class="num">Subagents</th><th class="num">AI Credits</th><th>Files</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+  el.innerHTML='<div class="table-card"><div class="section-title">All Sessions &mdash; '+sessions.length+' shown</div><div class="sessions-scroll table-scroll"><table><thead><tr><th>Session</th><th>Project</th><th>Summary</th><th>Last Active</th><th class="num">Duration</th><th>Model</th><th class="num">Turns</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Cache %</th><th class="num">Tools</th><th class="num">Subagents</th><th class="num">AI Credits</th><th>Files</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
   el.querySelectorAll('.file-link[data-path]').forEach(link => {
     link.addEventListener('click', () => { vscode.postMessage({type:'openFile',path:link.dataset.path}); });
   });

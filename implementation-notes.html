@@ -878,5 +878,13 @@ chain read:
       model, this constant needs updating.</li>
 </ul>
 
+<h2>Status hover alignment (1.10.66)</h2>
+<ul>
+  <li><strong>Design decision:</strong> Snapshot now uses a native four-column Markdown table, matching Copilot's own status-hover pattern. Each row contains two label/value pairs and both value columns use Markdown right alignment.</li>
+  <li><strong>Deviation:</strong> Rounded HTML grouping was dropped because VS Code sanitizes the layout CSS needed to stretch it.</li>
+  <li><strong>Tradeoff:</strong> The table grows from its content instead of a fixed pixel width, so it remains responsive to values, fonts, and tooltip size.</li>
+  <li><strong>Open question:</strong> Visual acceptance still requires testing inside VS Code because TypeScript and lint checks cannot verify native hover geometry.</li>
+</ul>
+
 </body>
 </html>

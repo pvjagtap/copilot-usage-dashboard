@@ -641,6 +641,16 @@ const SIDEBAR_JS = `
       tokBar('Input',  b.tokens.input,  maxTok) +
       tokBar('Output', b.tokens.output, maxTok) +
       tokBar('Cache',  b.tokens.cached, maxTok);
+    const hitPctLabel = b.cacheHitPct >= 80 ? 'excellent'
+                     : b.cacheHitPct >= 30 ? 'ok'
+                     : 'cold';
+    const cacheHitCard = b.tokens.input > 0
+      ? '<div class="card">' +
+          '<div class="card-title"><span>Cache Hit Rate (cycle)</span></div>' +
+          '<div class="big">' + b.cacheHitPct.toFixed(1) + '%<span class="unit">' + hitPctLabel + '</span></div>' +
+          '<div class="muted tiny">' + fmt(b.tokens.cached) + ' cached / ' + fmt(b.tokens.input) + ' prompt</div>' +
+        '</div>'
+      : '';
 
     const budgetLabel = b.budget > 0
       ? '<div class="muted tiny">' + (b.promoActive ? 'promo budget ' : 'budget ') + fmtAic(b.budget) + ' AIC</div>'
@@ -652,6 +662,7 @@ const SIDEBAR_JS = `
         '<div class="big">' + fmtAic(b.totalAic) + '<span class="unit">AIC · overage ' + fmtUsd(b.totalUsd) + '</span></div>' +
         budgetLabel +
       '</div>' +
+      cacheHitCard +
       '<div class="card">' + sparkBlock + '</div>' +
       '<div class="card"><div class="card-title"><span>By Model</span></div>' + modelBars + '</div>' +
       '<div class="card"><div class="card-title"><span>By Day of Week</span></div>' + dowBars + '</div>' +

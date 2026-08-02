@@ -9,6 +9,7 @@ import { CliScanResult } from "./cliScanner";
 import { LiveStats, OTelRequest } from "./otelReceiver";
 import { AICCalculator, AICConfig, DEFAULT_AIC_CONFIG, createCalculatorFromConfig, getPromoInfo, classifyModelBillability } from "./aicCredits";
 import { classifyByCatalog, getCachedCatalog } from "./modelCatalog";
+import { computeCacheHit } from "./cache";
 
 /**
  * AIC billing effective date. Only sessions/turns on or after this date
@@ -205,6 +206,10 @@ export interface SessionView {
   actualPrompt: number;
   /** Actual cumulative output from debug-logs. 0 if no debug data. */
   actualOutput: number;
+  /** Cumulative cache-read (input) tokens from debug-logs. 0 if not reported. Used for cache-hit-rate. */
+  actualCached: number;
+  /** Cached / prompt * 100 for this session. Pre-computed via cache.ts — do NOT inline the formula in consumers. */
+  cacheHitPct: number;
   toolRounds: number;
   toolCalls: number;
   subagents: number;
@@ -408,11 +413,15 @@ export interface LiveOtelData {
      * are excluded from `sessionAIC` / `lastRequestAIC` (issue #5).
      */
     isBillable: boolean;
+    /** cached / prompt * 100. Pre-computed here so the webview never repeats the formula (see cache.ts). */
+    cacheHitPct: number;
   }>;
   /** Session-cumulative AIC credits computed from live OTel data */
   sessionAIC: number;
   /** Last single request's AIC credits */
   lastRequestAIC: number;
+  /** cached / prompt * 100 across all byModel rows (see cache.ts). */
+  cacheHitPct: number;
   /**
    * Σ `aicCredits` across `byModel` rows whose `isBillable === false`
    * (after the post-processor reclassifies). Used by the dashboard tile
@@ -491,6 +500,17 @@ function computeSessionViews(sessions: Session[], toolCalls: ToolCall[], turns: 
     toolCountMap.set(tc.sessionId, (toolCountMap.get(tc.sessionId) ?? 0) + 1);
   }
 
+  // Per-session cached (cache-read) input tokens from debug logs. Used for
+  // the cache-hit-rate metric (cached / prompt — prompt already includes
+  // cached as a subset, see aicCredits.ts:452) shown in the dashboard
+  // Sessions table and Live OTel stats-row.
+  const sessionCachedMap = new Map<string, number>();
+  for (const t of turns) {
+    if (t.debugCachedTokens > 0) {
+      sessionCachedMap.set(t.sessionId, (sessionCachedMap.get(t.sessionId) ?? 0) + t.debugCachedTokens);
+    }
+  }
+
   // Per-session AIC credits (only for turns on/after AIC_EFFECTIVE_DATE)
   // Prefer actual API-reported AIC (debugAicCredits) over computed from rates
   const sessionCreditsMap = new Map<string, number>();
@@ -518,6 +538,8 @@ function computeSessionViews(sessions: Session[], toolCalls: ToolCall[], turns: 
       const end = new Date(s.lastTimestamp).getTime();
       if (end > start) { durationMin = Math.round((end - start) / 60000 * 10) / 10; }
     }
+    const sessionPrompt = s.debugTotalPrompt || s.totalPromptTokens;
+    const sessionCached = sessionCachedMap.get(s.sessionId) ?? 0;
 
     return {
       sessionId: s.sessionId,
@@ -542,6 +564,8 @@ function computeSessionViews(sessions: Session[], toolCalls: ToolCall[], turns: 
       output: s.totalOutputTokens,
       actualPrompt: s.debugTotalPrompt,
       actualOutput: s.debugTotalOutput,
+      actualCached: sessionCached,
+      cacheHitPct: computeCacheHit(sessionPrompt, sessionCached).pct,
       toolRounds: s.toolCallRounds,
       toolCalls: toolCountMap.get(s.sessionId) ?? 0,
       subagents: s.subagentCalls,
@@ -733,6 +757,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         hasActualCredits,
         // Backfilled by the post-processor that runs after the if/else chain.
         isBillable: false,
+        cacheHitPct: 0,
       };
     });
     const pendingSessionAIC = Array.from(pendingByModel.values()).reduce((sum, row) => sum + row.credits, 0);
@@ -804,6 +829,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
       sessionAIC: Math.round(sessionAIC * 100) / 100,
       lastRequestAIC: Math.round(lastRequestAIC * 100) / 100,
       informationalAIC: 0,
+      cacheHitPct: 0,
     };
   } else {
     // Debug-log-only fallback (no OTel data yet). Same activationTime scope
@@ -894,10 +920,12 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           hasActualCredits: true,
           // Backfilled by the post-processor below.
           isBillable: false,
+          cacheHitPct: 0,
         })),
         sessionAIC: Math.round(sessionAIC * 100) / 100,
         lastRequestAIC: Math.round(((mostRecentRequest?.nanoAiu ?? 0) / 1e9) * 100) / 100,
         informationalAIC: 0,
+        cacheHitPct: 0,
       };
     } else if (debugTurnsToday.length > 0) {
       // Per-model accumulator. `aicCredits` is summed from the per-llm_request
@@ -1071,11 +1099,13 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           // `hasActualCredits` is carried through by the spread above.
           // Backfilled by the post-processor below.
           isBillable: false,
+          cacheHitPct: 0,
         })),
         // No ratchet — see OTel branch above for rationale.
         sessionAIC: Math.round(sessionAIC * 100) / 100,
         lastRequestAIC: Math.round(lastRequestAIC * 100) / 100,
         informationalAIC: 0,
+        cacheHitPct: 0,
       };
     } else {
       liveOtel = {
@@ -1091,6 +1121,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         sessionAIC: 0,
         lastRequestAIC: 0,
         informationalAIC: 0,
+        cacheHitPct: 0,
       };
     }
   }
@@ -1114,7 +1145,10 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     // `sessionAIC` to 0.00 while individual byModel rows still showed real
     // billed credits. `excludeModels` still wins (user explicit override).
     isBillable: classifyModelBillability(calculator, config, row.model, row.hasActualCredits, classifyByCatalog),
+    cacheHitPct: computeCacheHit(row.prompt, row.cached).pct,
   }));
+  // Aggregate cache-hit — one place, one formula. See cache.ts.
+  liveOtel.cacheHitPct = computeCacheHit(liveOtel.prompt, liveOtel.cached).pct;
   // Always recompute the surface AIC values so the dashboard tile + status
   // bar tooltip stay in sync with the byModel classification. When the
   // master switch is off, every row counts as billable (legacy behaviour).

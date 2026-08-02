@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { LiveStats } from "./otelReceiver";
 import { ScanStats } from "./scanner";
+import { computeCacheHit, tierLabel } from "./cache";
 
 /** Format a credit delta as a compact dollar/cent string for the flash badge. */
 function fmtDelta(credits: number, dollarPerCredit: number): string {
@@ -65,6 +66,40 @@ export interface StatusBarData {
   };
   /** AIC → USD conversion rate (overageCostPerCredit, default 0.01). */
   dollarPerCredit?: number;
+  /**
+   * Optional per-period AIC + per-model token breakdown for the tooltip's
+   * DAILY / WEEKLY / THIS MONTH donut row. `byModel.tokens` is used to
+   * derive donut arc shares (token-share ≈ cost-share within a period).
+   */
+  ranges?: {
+    daily: PeriodStats;
+    weekly: PeriodStats;
+    month: PeriodStats;
+  };
+  /**
+   * Overall cache-hit rate across ALL sessions in the current billing cycle
+   * (cached / prompt, where prompt already includes cached — see
+   * aicCredits.ts:452). Rendered as the "Cache hit (cycle)" row in the
+   * Snapshot table so users see the workspace-wide efficiency alongside
+   * the live session-scoped number from the Cache reuse card.
+   */
+  cycleCacheHitPct?: number;
+  /**
+   * Session-scope prompt / cached counters sourced from `dashData.liveOtel`
+   * — the SAME numbers the dashboard's "Live OpenTelemetry" section renders.
+   * Threading them here guarantees the tooltip's "Cache hit (session)" row
+   * and the dashboard's Cache Hit KPI can never diverge (before this we had
+   * the tooltip reading `receiver.getStats()` directly, which excludes the
+   * debug-log overlay when port 14318 is held by another window).
+   */
+  liveSessionPrompt?: number;
+  liveSessionCached?: number;
+}
+
+export interface PeriodStats {
+  aic: number;
+  tokens: number;
+  byModel: Array<{ model: string; tokens: number }>;
 }
 
 export class StatusBarProvider {
@@ -85,7 +120,6 @@ export class StatusBarProvider {
   constructor(private commandId: string) {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     this.item.command = commandId;
-    this.item.tooltip = "Click to open Copilot Usage Dashboard";
     this.updateStatus(null);
     this.item.show();
   }
@@ -189,65 +223,189 @@ export class StatusBarProvider {
     this.item.tooltip = this.buildTooltipActive(data, otel, cs, dl);
   }
 
-  /** Tooltip for active states — keeps every datum that used to be on the bar. */
+  /**
+   * Tooltip for active states — rich MarkdownString hover modeled on
+   * dashboard-style cost cards. Uses Unicode-block progress bars, colored
+   * spans, codicons, and a compact stats grid. Every datum that used to be
+   * emitted in the plain-text v1 tooltip is preserved.
+   */
   private buildTooltipActive(
     data: StatusBarData | null,
     otel: LiveStats | null | undefined,
     cs: CurrentSessionInfo | null | undefined,
     dl: StatusBarData["dailyLimit"]
-  ): string {
-    const lines: string[] = [];
-    if (otel && otel.requests > 0) {
-      lines.push(
-        `Copilot Token Usage — This Session (${otel.requests} requests)`,
-        `  Prompt: ${otel.prompt.toLocaleString()}`,
-        `  Output: ${otel.completion.toLocaleString()}`,
-        `  Cached: ${otel.cached.toLocaleString()}`
-      );
-    } else if (cs) {
-      lines.push(
-        `Copilot Usage — Current Session`,
-        `  Session: ${cs.sessionShort}…`,
-        `  Model: ${cs.model}`,
-        `  Turns: ${cs.turns}`,
-        `  Prompt: ${cs.prompt.toLocaleString()}`,
-        `  Output: ${cs.output.toLocaleString()}`,
-        `  Tool calls: ${cs.toolCalls}`,
-        `  Duration: ${cs.durationMin}m`
-      );
-    }
-    // Always emit BOTH AIC lines, even at 0.00, so users can see whether the
-    // dashboard is reading their session at all. Pre-v1.10.14 the truthy check
-    // hid `currentSessionAIC` when it was 0, which made the BYOK demotion bug
-    // (sessionAIC dropped to 0 by classifier) look like "no data" — confusing
-    // since the per-model table still showed real billed credits. Now the line
-    // is always there, and if any AIC was excluded as informational we surface
-    // it on the same line so the discrepancy is visible at a glance.
-    const sessAic = data?.currentSessionAIC ?? 0;
+  ): vscode.MarkdownString {
+    const dpc = data?.dollarPerCredit ?? 0.01;
+    const sessAic = data?.currentSessionAIC ?? cs?.aicCredits ?? 0;
+    const sessDollars = sessAic * dpc;
+    const lastReq = data?.lastRequestAIC ?? 0;
     const infoAic = data?.informationalAIC ?? 0;
-    const sessSuffix = infoAic > 0 ? `  (+${infoAic.toFixed(2)} informational excluded)` : "";
-    lines.push(`  AI Credits (session total): ${sessAic.toFixed(2)}${sessSuffix}`);
-    lines.push(`  AI Credits (last request): ${(data?.lastRequestAIC ?? 0).toFixed(2)}`);
-    if (otel && otel.requests > 0 && cs) {
-      lines.push("", `Session: ${cs.sessionShort}… | Model: ${cs.model} | Turns: ${cs.turns}`);
-    } else {
-      lines.push("");
+
+    const md: string[] = [];
+
+    // ── Headline: big cost + stage badge ──────────────────────
+    // Scope disambiguation: the $ next to the header is SESSION-scope
+    // (this VS Code window only); the DAILY/WEEKLY/THIS MONTH donuts below
+    // are workspace-wide period totals. Explicit "· Session" label prevents
+    // users conflating the two scopes.
+    const stageBadge = stageBadgeMd(dl);
+    md.push(
+      `### $(dashboard) Copilot Usage &nbsp;<span style="color:${COL.muted}">· Session</span>&nbsp; <span style="color:${COL.accent}">**$${sessDollars.toFixed(2)}**</span>${stageBadge}`
+    );
+    const sub: string[] = [`${sessAic.toFixed(2)} credits this session`];
+    if (lastReq > 0) {
+      sub.push(`last +${fmtDelta(lastReq, dpc).replace(/^\+/, "")}`);
+    }
+    if (infoAic > 0) {
+      sub.push(`<span style="color:${COL.muted}">$${(infoAic * dpc).toFixed(2)} excluded</span>`);
+    }
+    md.push(sub.join(" &nbsp;·&nbsp; "));
+    md.push("");
+
+    // ── Card 1: DAILY / WEEKLY / THIS MONTH donut row (per-model shares) ──
+    // Legend lists ONLY currently-active models (this OTel session, else the
+    // debug-log's current session model). Historical-only models still show
+    // as slices in the donuts but fold into a neutral "other" grey — so the
+    // legend never grows to include stale versions like `claude-opus-4.6`
+    // when the user is on `claude-opus-4.7` today.
+    if (data?.ranges) {
+      const legend = buildActiveModelLegend(otel, cs);
+      md.push(
+        `| DAILY | WEEKLY | THIS MONTH |`,
+        `|:-:|:-:|:-:|`,
+        `| ${periodDonutMd(data.ranges.daily, legend, dpc)} | ${periodDonutMd(data.ranges.weekly, legend, dpc)} | ${periodDonutMd(data.ranges.month, legend, dpc)} |`,
+      );
+      if (legend.length > 0) {
+        const legendCells = legend
+          .map((l) => `<span style="color:${l.color}">●</span> ${escapeMd(l.model)}`)
+          .join(" &nbsp;·&nbsp; ");
+        md.push("");
+        md.push(
+          `<span style="color:${COL.muted}">${legendCells} &nbsp;·&nbsp; <span style="color:${COL.accent2}">●</span> other</span>`
+        );
+      }
+      md.push("");
+      md.push("---");
+      md.push("");
+    }
+
+    // ── Card 2: Daily limit progress bar ──
+    if (dl && dl.stage !== "none") {
+      const pctUsed = Math.min(100, Math.max(0, dl.percent));
+      const pctLeft = Math.max(0, 100 - pctUsed);
+      const barColor =
+        dl.stage === "limit" ? COL.danger : dl.stage === "brace" ? COL.warn : COL.accent;
+      const resetsIn = formatDuration(msUntilLocalMidnight());
+      const right =
+        dl.stage === "limit"
+          ? `<span style="color:${COL.danger}">$(stop-circle) At limit &nbsp;·&nbsp; resets in ${resetsIn}</span>`
+          : `<span style="color:${COL.muted}">$(clock) ${pctLeft.toFixed(0)}% left &nbsp;·&nbsp; resets in ${resetsIn}</span>`;
+      md.push(`**$(shield) Daily limit** &nbsp;&nbsp; ${right}`);
+      md.push("");
+      md.push(progressBarMd(pctUsed, barColor));
+      md.push("");
+      md.push(
+        `<span style="color:${COL.muted}">$${dl.usedDollars.toFixed(2)} of $${dl.limitDollars.toFixed(2)} &nbsp;·&nbsp; ${pctUsed.toFixed(0)}% used</span>`
+      );
+      md.push("");
+    }
+
+    // ── Card 3: Requests (compact — one header line + bar + terse footer) ──
+    const reqStats = otel && otel.requests > 0
+      ? {
+          requests: otel.requests,
+          prompt: otel.prompt,
+          completion: otel.completion,
+          source: "live",
+        }
+      : cs
+        ? { requests: cs.turns, prompt: cs.prompt, completion: cs.output, source: "log" }
+        : null;
+    if (reqStats && reqStats.requests > 0) {
+      const totalTokens = reqStats.prompt + reqStats.completion;
+      // Soft benchmark: 20 requests per window — relative indicator, not a cap.
+      const reqPct = Math.min(100, (reqStats.requests / 20) * 100);
+      const srcTag =
+        reqStats.source === "log"
+          ? ` <span style="color:${COL.muted}">$(database) log</span>`
+          : "";
+      md.push(
+        `**$(zap) Requests** &nbsp; <span style="color:${COL.muted}">${reqStats.requests} · ${fmtTokens(totalTokens)} tok${srcTag}</span>`
+      );
+      md.push("");
+      md.push(progressBarMd(reqPct, COL.accent2));
+      md.push("");
+      md.push(
+        `<span style="color:${COL.muted}">in ${fmtTokens(reqStats.prompt)} &nbsp;·&nbsp; out ${fmtTokens(reqStats.completion)}</span>`
+      );
+      md.push("");
+      md.push("---");
+      md.push("");
+    }
+
+    // ── Card 4: Cache hit ratio (Fable / blue-accent analogue) ──
+    // Formula + tier thresholds live in cache.ts — the single source of truth
+    // that prevents surface-to-surface drift (see cache.ts header). Computed
+    // once and reused in the Snapshot row below to avoid duplicate work.
+    const cacheP = (data?.liveSessionPrompt ?? otel?.prompt) ?? 0;
+    const cacheC = (data?.liveSessionCached ?? otel?.cached) ?? 0;
+    const sessionHit = computeCacheHit(cacheP, cacheC);
+    if (sessionHit.tier !== "empty") {
+      const label =
+        sessionHit.tier === "excellent"
+          ? `<span style="color:${COL.info}">$(sparkle) ${tierLabel(sessionHit.tier)}</span>`
+          : `<span style="color:${COL.muted}">$(archive) ${tierLabel(sessionHit.tier)}</span>`;
+      md.push(`**$(archive) Cache reuse** &nbsp;&nbsp; ${label}`);
+      md.push("");
+      md.push(progressBarMd(sessionHit.pct, COL.info));
+      md.push("");
+      md.push(
+        `<span style="color:${COL.muted}">${sessionHit.cached.toLocaleString()} cached &nbsp;·&nbsp; ${sessionHit.pct.toFixed(0)}% of input</span>`
+      );
+      md.push("");
+    }
+
+    // Single-pair native markdown table. Right-alignment via `--:`;
+    // the surrounding SVG progress bars already stretch the hover to their
+    // width, so the value column sits flush with the tooltip's right edge.
+    md.push(`**$(watch) Snapshot**`);
+    md.push(`| &nbsp; | &nbsp; |`);
+    md.push(`|:--|--:|`);
+    md.push(`| Session AIC | ${sessAic.toFixed(2)} &nbsp;·&nbsp; $${sessDollars.toFixed(2)} |`);
+    md.push(`| Last request | +${lastReq.toFixed(2)} credits |`);
+    if (infoAic > 0) {
+      md.push(`| Excluded (BYOK) | $${(infoAic * dpc).toFixed(2)} |`);
+    }
+    if (sessionHit.tier !== "empty") {
+      md.push(`| Cache hit (session) | **${sessionHit.pct.toFixed(1)}%** |`);
+    }
+    if (data?.cycleCacheHitPct !== undefined) {
+      md.push(`| Cache hit (cycle) | **${data.cycleCacheHitPct.toFixed(1)}%** |`);
+    }
+    if (cs) {
+      md.push(`| Model | ${escapeMd(cs.model)} |`);
+      md.push(`| Turns · Duration | ${cs.turns} · ${cs.durationMin}m |`);
+      md.push(`| Tool calls | ${cs.toolCalls.toLocaleString()} |`);
+      md.push(`| Session | \`${escapeMd(cs.sessionShort)}…\` |`);
     }
     if (data?.totalSessions) {
-      lines.push(`Total sessions in workspace: ${data.totalSessions}`);
+      md.push(`| Sessions in workspace | ${data.totalSessions.toLocaleString()} |`);
     }
-    if (dl && dl.stage !== "none") {
-      lines.push(
-        `Daily limit: $${dl.usedDollars.toFixed(2)} / $${dl.limitDollars.toFixed(2)} (${dl.percent.toFixed(0)}%)`
-      );
-    }
-    lines.push(`Dashboard AIC cards show billing-cycle totals across sessions.`);
-    lines.push(
+    md.push("");
+
+    md.push(`<span style="color:${COL.muted}">Cards = billing cycle totals</span>`);
+    md.push("");
+    md.push(
       dl && dl.stage === "limit"
-        ? "Click to re-open the Daily Limit Shield"
-        : "Click to open full dashboard"
+        ? `$(link-external) **Click** to re-open the Daily Limit Shield`
+        : `$(link-external) **Click** to open the full dashboard`
     );
-    return lines.filter((l) => l !== undefined).join("\n");
+
+    const tip = new vscode.MarkdownString(md.join("\n"));
+    tip.supportThemeIcons = true;
+    tip.supportHtml = true;
+    tip.isTrusted = true;
+    return tip;
   }
 
   /** Schedule a one-shot re-render at flashUntil to drop the +X\u00a2 badge. */
@@ -361,19 +519,234 @@ export class StatusBarProvider {
     return f[this.walkFrame % f.length];
   }
 
-  private buildTooltipForIdle(dl: StatusBarData["dailyLimit"]): string {
-    if (!dl) {
-      return "Click to open Copilot Usage Dashboard";
+  private buildTooltipForIdle(dl: StatusBarData["dailyLimit"]): vscode.MarkdownString {
+    const md: string[] = [];
+    md.push(`### $(dashboard) Copilot Usage`);
+    md.push(`<span style="color:${COL.muted}">No activity yet in this window.</span>`);
+    md.push("");
+    if (dl && dl.stage !== "none") {
+      const pctUsed = Math.min(100, Math.max(0, dl.percent));
+      const barColor =
+        dl.stage === "limit" ? COL.danger : dl.stage === "brace" ? COL.warn : COL.accent;
+      md.push(`**$(shield) Daily limit** ${stageBadgeMd(dl)}`);
+      md.push(progressBarMd(pctUsed, barColor));
+      md.push(
+        `<span style="color:${COL.muted}">$${dl.usedDollars.toFixed(2)} of $${dl.limitDollars.toFixed(2)} &nbsp;·&nbsp; ${pctUsed.toFixed(0)}% used</span>`
+      );
+      md.push("");
     }
-    const clickHint =
-      dl.stage === "limit"
-        ? "Click to re-open the Daily Limit Shield"
-        : "Click to open Copilot Usage Dashboard";
-    return [
-      `Daily limit: $${dl.usedDollars.toFixed(2)} / $${dl.limitDollars.toFixed(2)}  (${dl.used.toFixed(1)} / ${dl.limit} AIC, ${dl.percent}%)`,
-      `Stage: ${dl.stage}${dl.snoozed ? " (snoozed)" : ""}${dl.resumed ? " (resumed)" : ""}${dl.dollarMode ? " — dollar mode" : ""}`,
-      "",
-      clickHint,
-    ].join("\n");
+    md.push(
+      dl && dl.stage === "limit"
+        ? `$(link-external) **Click** to re-open the Daily Limit Shield`
+        : `$(link-external) **Click** to open the full dashboard`
+    );
+    const tip = new vscode.MarkdownString(md.join("\n"));
+    tip.supportThemeIcons = true;
+    tip.supportHtml = true;
+    tip.isTrusted = true;
+    return tip;
   }
 }
+
+// ─── Rich-tooltip helpers ─────────────────────────────────────
+
+/** Palette tuned to read on both light and dark VS Code themes. */
+const COL = {
+  accent: "#e06c4a", // orange — headline & session bar (matches Claude card)
+  accent2: "#8a9aa6", // slate — secondary progress
+  info: "#3b82f6", // blue — cache / positive signal (Fable bar)
+  danger: "#e53935",
+  warn: "#f0a020",
+  muted: "#888888",
+  track: "#3a3a3a",
+} as const;
+
+/** Discrete colors used for the per-model breakdown (donut slices). */
+const MODEL_PALETTE = ["#e06c4a", "#2ea88a", "#8a4bd8", "#4a90e2", "#f0a020", "#d94a4a"];
+
+/** Escape markdown-sensitive chars in user-supplied strings (model names, ids). */
+function escapeMd(s: string): string {
+  return s.replace(/[|`*_<>]/g, (c) => `\\${c}`);
+}
+
+/** Render a smooth pill-shaped progress bar as an SVG data URI. */
+function progressBarMd(pct: number, color: string): string {
+  // Narrower bar keeps the hover width close to the Snapshot table's natural
+  // width so the right-aligned value column reads flush with the tooltip edge.
+  const w = 220;
+  const h = 10;
+  const clamped = Math.max(0, Math.min(100, pct));
+  const filledW = (clamped / 100) * w;
+  const r = h / 2;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
+    `<rect x="0" y="0" width="${w}" height="${h}" rx="${r}" ry="${r}" fill="${COL.track}"/>` +
+    (filledW > 0
+      ? `<rect x="0" y="0" width="${filledW.toFixed(2)}" height="${h}" rx="${r}" ry="${r}" fill="${color}"/>`
+      : "") +
+    `</svg>`;
+  return `![](${svgDataUri(svg)})`;
+}
+
+/** Encode an inline SVG as a data URI safe for MarkdownString images. */
+function svgDataUri(svg: string): string {
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+/** Render a donut/ring chart of model shares (visual match for the reference cost card). */
+function donutMd(rows: Array<{ pct: number; color: string }>, size = 96): string {
+  if (rows.length === 0) {
+    return "";
+  }
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = size * 0.36;
+  const strokeW = size * 0.18;
+  const C = 2 * Math.PI * r;
+  const parts: string[] = [];
+  // Track ring behind the slices.
+  parts.push(
+    `<circle cx="${cx}" cy="${cy}" r="${r.toFixed(2)}" fill="none" stroke="${COL.track}" stroke-width="${strokeW.toFixed(2)}"/>`
+  );
+  let offset = 0;
+  for (const s of rows) {
+    if (s.pct <= 0) {
+      continue;
+    }
+    const arc = (s.pct / 100) * C;
+    const gap = C - arc;
+    parts.push(
+      `<circle cx="${cx}" cy="${cy}" r="${r.toFixed(2)}" fill="none" stroke="${s.color}" ` +
+        `stroke-width="${strokeW.toFixed(2)}" stroke-linecap="butt" ` +
+        `stroke-dasharray="${arc.toFixed(2)} ${gap.toFixed(2)}" ` +
+        `stroke-dashoffset="${(-offset).toFixed(2)}" ` +
+        `transform="rotate(-90 ${cx} ${cy})"/>`
+    );
+    offset += arc;
+  }
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">` +
+    parts.join("") +
+    `</svg>`;
+  return `![](${svgDataUri(svg)})`;
+}
+
+/** Milliseconds until local midnight — for "resets in X" captions. */
+function msUntilLocalMidnight(): number {
+  const now = new Date();
+  const mid = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0);
+  return mid.getTime() - now.getTime();
+}
+
+/** Short human duration: "3h 42m" or "1d 4h" or "12m". */
+function formatDuration(ms: number): string {
+  const totalMin = Math.max(0, Math.floor(ms / 60000));
+  const d = Math.floor(totalMin / 1440);
+  const h = Math.floor((totalMin % 1440) / 60);
+  const m = totalMin % 60;
+  if (d > 0) {
+    return `${d}d ${h}h`;
+  }
+  if (h > 0) {
+    return `${h}h ${m}m`;
+  }
+  return `${m}m`;
+}
+
+/** Format a token count as compact "1.2M" / "3.4K". */
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000_000) {
+    return `${(n / 1_000_000_000).toFixed(1)}B`;
+  }
+  if (n >= 1_000_000) {
+    return `${(n / 1_000_000).toFixed(2)}M`;
+  }
+  if (n >= 1_000) {
+    return `${(n / 1_000).toFixed(1)}K`;
+  }
+  return n.toLocaleString();
+}
+
+/**
+ * Legend of *currently-active* models — the ones actually in use in this
+ * VS Code window (OTel byModel preferred, debug-log `cs.model` fallback).
+ * Historical models present in the 30-day range but NOT active right now
+ * are intentionally excluded so the row doesn't list stale versions
+ * (e.g. `claude-opus-4.6` when the session is on `claude-opus-4.7`).
+ * Anything not in this legend renders as the neutral "other" grey slice
+ * inside the donuts.
+ */
+function buildActiveModelLegend(
+  otel: LiveStats | null | undefined,
+  cs: CurrentSessionInfo | null | undefined
+): Array<{ model: string; color: string }> {
+  const active = new Map<string, number>();
+  if (otel && otel.byModel.size > 0) {
+    for (const m of otel.byModel.values()) {
+      const tokens = m.prompt + m.completion;
+      if (tokens > 0) {
+        active.set(m.model, tokens);
+      }
+    }
+  }
+  // OTel-silent fallback: pick up the model the debug-log currently attributes
+  // this window to, so idle-OTel sessions still get a legend entry.
+  if (active.size === 0 && cs && cs.model) {
+    active.set(cs.model, cs.prompt + cs.output);
+  }
+  const sorted = [...active.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4);
+  return sorted.map(([model], i) => ({ model, color: MODEL_PALETTE[i % MODEL_PALETTE.length] }));
+}
+
+/**
+ * Render one period as a small donut (per-model shares from `byModel`) with
+ * dollar amount and token count underneath. Slice colors are pulled from the
+ * shared legend so DAILY / WEEKLY / MONTH stay visually aligned.
+ */
+function periodDonutMd(
+  p: PeriodStats,
+  legend: Array<{ model: string; color: string }>,
+  dpc: number
+): string {
+  const usd = (p.aic * dpc).toFixed(2);
+  const tk = fmtTokens(p.tokens);
+  const otherColor = COL.accent2;
+  const rows: Array<{ pct: number; color: string }> = [];
+  const totalTokens = p.byModel.reduce((s, m) => s + m.tokens, 0);
+  if (totalTokens > 0) {
+    let coveredPct = 0;
+    for (const legEntry of legend) {
+      const found = p.byModel.find((m) => m.model === legEntry.model);
+      if (found) {
+        const pct = (found.tokens / totalTokens) * 100;
+        rows.push({ pct, color: legEntry.color });
+        coveredPct += pct;
+      }
+    }
+    const otherPct = Math.max(0, 100 - coveredPct);
+    if (otherPct > 0.1) {
+      rows.push({ pct: otherPct, color: otherColor });
+    }
+  }
+  // Empty-period fallback: render an empty ring so the layout stays consistent.
+  const donut = rows.length > 0 ? donutMd(rows, 76) : donutMd([{ pct: 100, color: COL.track }], 76);
+  return `${donut}<br>**$${usd}**<br><span style="color:${COL.muted}">${tk} tok</span>`;
+}
+
+/** Stage badge shown next to the headline (warn/brace/limit). */
+function stageBadgeMd(dl: StatusBarData["dailyLimit"]): string {
+  if (!dl || dl.stage === "none") {
+    return "";
+  }
+  if (dl.stage === "limit") {
+    const label = dl.resumed ? "resumed" : dl.snoozed ? "snoozed" : "at limit";
+    return ` &nbsp;<span style="color:${COL.danger}">$(stop-circle) ${label}</span>`;
+  }
+  if (dl.stage === "brace") {
+    return ` &nbsp;<span style="color:${COL.warn}">$(flame) brace</span>`;
+  }
+  return ` &nbsp;<span style="color:${COL.warn}">$(warning) warn</span>`;
+}
+

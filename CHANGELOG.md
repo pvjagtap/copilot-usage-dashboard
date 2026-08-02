@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.67] - 2026-08-02
+
+### Changed
+
+- **Status-bar hover width tuned to 220 px.** Progress bars shrunk from 280 → 220 px so the hover matches the Snapshot table's natural content width. The right-aligned value column now reads flush with the tooltip's right edge instead of floating mid-card. Snapshot itself is a single-pair-per-row native Markdown table (`|:--|--:|`) — no HTML, CSS, or fixed padding.
+
+## [1.10.66] - 2026-08-02
+
+### Added
+
+- **Rich status-bar hover — full visual redesign.** The hover tooltip is now a `vscode.MarkdownString` with `supportThemeIcons` + `supportHtml` + `isTrusted` rather than the plain-text `\n`-joined string it used to be. Layout is dashboard-style: headline (`Copilot Usage · Session $X.XX`) with adaptive stage badge, three side-by-side **SVG donut charts** for DAILY / WEEKLY / THIS MONTH periods with a shared model→color legend under them, progress-bar cards for **Daily limit / Requests / Cache reuse**, and a responsive native Markdown Snapshot table containing session AIC / last request / cache hit (session) / cache hit (cycle) / model / turns · duration / tool calls / session id / workspace total. Every existing datum from the old text tooltip is preserved. Idle state gets the same treatment.
+- **Cache hit rate as a first-class metric across four surfaces.** New `src/cache.ts` module owns the formula and tier thresholds so every UI can never disagree again (see refactor note below). The metric now appears in: (1) dashboard hero row — new green `Cache Hit` KPI card between `Overage` and `Daily Pace` with sub-text `X.XM cached / Y.YM prompt`; (2) dashboard `Live OpenTelemetry` stats-row — new `Cache Hit · X.X%` KPI + new `Hit %` column in the by-model table; (3) dashboard `All Sessions` table — new `Cache %` column per session; (4) status-bar tooltip — new `Cache reuse` bar card + `Cache hit (session)` / `Cache hit (cycle)` rows in the Snapshot table; (5) sidebar Breakdown — new prominent `Cache Hit Rate (cycle)` card right after `Total Credits (cycle)`, using the same `.big` bold styling as Total Credits.
+- **Model context-window plumbed from CAPI.** `ModelCatalogEntry.contextMax` now captures the model's true input ceiling from CAPI's `billing.token_prices.long_context.context_max ?? default.context_max`. Exported `getContextMaxFor(modelId)` lookup helper. Not yet wired into any UI (deferred pending user decision on utilization-bar design) but the data is now available.
+- **`Tool calls` row** back in the tooltip's Snapshot table (was in v1 plain-text tooltip, dropped during first redesign).
+- **`Session AIC (session)` vs `Cache hit (cycle)` disambiguation.** Header now reads `Copilot Usage · Session $X.XX` with an explicit muted `· Session` scope tag so the headline dollar amount can't be confused with the workspace-wide DAILY / WEEKLY / THIS MONTH donut totals below.
+- **"Resets in Xh Ym" caption on the daily-limit progress bar.** Computed from local midnight so users see how long until the daily counter clears.
+
+### Changed
+
+- **Cache-hit-rate formula centralized in `src/cache.ts`.** Rationale: between v1.10.53 and v1.10.58 we shipped two consecutive cache-hit bugs caused by the formula and its data source living in 5+ places. `computeCacheHit(prompt, cached)` and `tierLabel()` are now the single source of truth. Extension-host callers import it directly; the webview (sandboxed, can't `import`) receives **pre-computed** `cacheHitPct` fields on `LiveOtelData`, `LiveOtelData.byModel[i]`, and `SessionView` so it never touches the arithmetic. Only exception: dashboard hero range-aggregate is user-selectable at render time and stays inline with a big pointer comment to `cache.ts`.
+- **"THIS MONTH" is now the current calendar month**, not a 30-day rolling window. Aggregator switched from `today − 29 days` to `new Date(year, month, 1)` for the period start so on Aug 2 the donut shows Aug 1 → Aug 2, not Jul 4 → Aug 2. Matches user expectation for the label.
+- **Snapshot uses Copilot's native responsive table pattern.** Two label/value pairs per row give the table enough intrinsic content to use the hover width, while Markdown `--:` alignment right-aligns both value columns. No fixed pixel width, padding characters, or sanitizer-sensitive layout CSS is used.
+- **Section separators in tooltip.** Horizontal rules (`---`) separate the logical groups (donut row + legend, Daily limit, Requests, Cache reuse, Snapshot).
+- **Compact Requests card.** Header now reads `$(zap) Requests · N · X.YM tok · $(database) log`, then a slate progress bar, then `in X.YM · out X.XK` on the third line. Was previously a long ragged one-liner that wrapped inline with the SVG bar.
+- **Debug-log fallback for tooltip cards.** When OTel is silent (port 14318 held by another window), the Cost-by-model donut and Requests card synthesize from `cs.model / cs.turns / cs.prompt / cs.output` so the tooltip still renders meaningfully. Cache-reuse card intentionally stays OTel-only — debug logs don't carry cached-token counts.
+- **Sidebar cycle scope aligned to billing cycle.** Was filtered by `AIC_EFFECTIVE_DATE` (all-time since AIC launched); now filtered by `dashData.aicSummary.billingCycleStart..billingCycleEnd`, matching the dashboard hero's cycle window and the tooltip's `Cache hit (cycle)` row.
+- **Sidebar cache aggregation switched to per-session.** Was iterating `scanTurns` and summing `debugPromptTokens/debugCachedTokens` per turn — drifted ~0.3 % from the dashboard because sessions spanning the cycle boundary were counted whole by the dashboard but only partially by the sidebar. Now iterates `dashData.sessionsAll` and sums `actualPrompt / actualCached`, matching the dashboard hero and `computeCycleCacheHit()` exactly.
+
+### Fixed
+
+- **Cache-hit formula was under-reporting by ~2x** (bug shipped in 1.10.53, fixed in 1.10.56). Was `cached / (prompt + cached)` — but Copilot's `prompt_tokens` counter already includes cached reads as a subset (see [aicCredits.ts:452](src/aicCredits.ts)), so the naive form double-counted the denominator. Users seeing "49.9%" when their actual reuse was 99.5% traced the bug for us. All five surfaces corrected to `cached / prompt`.
+- **Three surfaces showing three different cache-hit numbers for the same conceptual metric** (bug shipped in 1.10.57, fixed in 1.10.58 + 1.10.61). Dashboard read `dashData.liveOtel.prompt/cached`; tooltip read `receiver.getStats()` (raw OTel — missing debug-log overlay when port 14318 held by another window); sidebar filtered by `AIC_EFFECTIVE_DATE` (all-time). Threaded `liveSessionPrompt / liveSessionCached` from `dashData.liveOtel` into `StatusBarData` so the tooltip's `Cache hit (session)` matches the dashboard's `Live OTel Cache Hit` KPI; switched sidebar to cycle-scoped per-session aggregation matching the dashboard hero and `computeCycleCacheHit()`.
+- **Dashboard "Live OTel by Model" table overflowed and clipped the AIC column.** Shortened four column headers (`Requests → Reqs`, `Trace Cache → Trace`, `Metric Cache → Metric`, `Effective Cache → Cached`), wrapped the table in a new `.table-scroll` container with `overflow-x:auto`, and added `white-space:nowrap` on `th` and `.num` cells. AIC column is now always reachable — either directly (headers small enough) or via inline horizontal scroll.
+- **`Session` short-id row was missing from Snapshot** after the markdown → HTML table conversion. Restored (`<code>instance…</code>`).
+- **Duplicate work in tooltip render:** `computeCacheHit()` was called twice with identical inputs (once for the Cache reuse card, once for the Snapshot row). Hoisted so it runs once and both surfaces consume the same result.
+- **Requests card no longer overflows the tooltip width.** Blank paragraph breaks now separate header, SVG bar, and in/out footer so the bar doesn't flow inline with adjacent text and the "out N.NK" no longer wraps below awkwardly.
+- **Model legend under period donuts lists only currently-active models.** Was showing stale historical models (e.g., `claude-opus-4.6 · claude-haiku-4.5`) pulled from the 30-day byModel union. Now derives from OTel `byModel` first, `cs.model` fallback; historical-only models still show as slices in the donuts but fold into a neutral grey "other" slice the legend names explicitly.
+- **Bottom hint text no longer forces the tooltip wider.** Shortened from `Dashboard AIC cards show billing-cycle totals across sessions.` (66 chars) to `Cards = billing cycle totals` (28 chars).
+- **Snapshot spacing no longer depends on stripped HTML/CSS.** Replaced the collapsing two-column layout with the same native multi-column Markdown table approach used by Copilot's own status hover.
+
+### Removed
+
+- **Two dead helpers** in [src/statusBar.ts](src/statusBar.ts): `topModels()` and `csFallbackModel()`. Left over from the abandoned single-donut "Cost by model" card that got replaced by the DAILY / WEEKLY / THIS MONTH donut row (~40 lines).
+
 ## [1.10.47] - 2026-07-31
 
 ### Changed

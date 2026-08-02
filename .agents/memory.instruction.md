@@ -16,3 +16,4 @@ applyTo: '**'
 - Repository currently has a single git commit baseline plus local uncommitted edits.
 - `C:\nodejs\node.exe node_modules\typescript\bin\tsc -p ./` compiles cleanly in this workspace.
 - `C:\nodejs\node.exe node_modules\eslint\bin\eslint.js src/**/*.ts` is the Windows-safe lint entrypoint; `node_modules\.bin\eslint` is a POSIX shim here.
+- Status-bar `MarkdownString` layout must use native Markdown tables; sanitizer-sensitive width/flex CSS is unreliable. Multi-column label/value pairs prevent intrinsic-width collapse without fixed dimensions.

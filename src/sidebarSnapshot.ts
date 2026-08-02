@@ -7,9 +7,10 @@
  * picks, slices, and shapes for narrow-column display.
  */
 
-import { DashboardData, SessionView, AIC_EFFECTIVE_DATE } from "./dashboardData";
+import { DashboardData, SessionView } from "./dashboardData";
 import { Turn } from "./scanner";
 import { LiveStats } from "./otelReceiver";
+import { computeCacheHit } from "./cache";
 
 // ─── DTO ──────────────────────────────────────────────────────
 
@@ -79,6 +80,13 @@ export interface SidebarBreakdown {
   modelsMore: number;
   byDow: Array<{ dow: string; credits: number; pct: number }>;
   tokens: { input: number; output: number; cached: number };
+  /**
+   * Cycle-wide cache-hit rate: cached / input * 100. Copilot's prompt
+   * counter already includes cached reads (see aicCredits.ts:452), so this
+   * is a straight ratio — same formula as the dashboard hero card and the
+   * status-bar tooltip's "Cache hit (cycle)" row.
+   */
+  cacheHitPct: number;
 }
 
 export interface SidebarSessionRow {
@@ -307,18 +315,24 @@ export function buildSidebarSnapshot(input: SidebarBuildInput): SidebarSnapshot 
     pct: safePct(credits, maxDow),
   }));
 
-  // Tokens — sum from scan turns since AIC effective date (already what
-  // dashboard uses). We use the same prefer-debug-then-fallback as scanner.
+  // Tokens — cycle-scoped aggregation. Sum per-SESSION (not per-turn) so
+  // the sidebar matches the dashboard's Cache Hit hero card and the
+  // tooltip's "Cache hit (cycle)" row exactly. The per-turn aggregation
+  // used before this fix drifted by ~0.3% when a session started before
+  // the cycle boundary but had turns inside — sessions were counted whole
+  // by dashboard/tooltip but only partially by the sidebar. Now identical.
+  const cycleStart = dashData.aicSummary.billingCycleStart;
+  const cycleEnd = dashData.aicSummary.billingCycleEnd;
   let inputTokens = 0;
   let outputTokens = 0;
   let cachedTokens = 0;
-  for (const t of scanTurns) {
-    if (!t.timestamp || t.timestamp.slice(0, 10) < AIC_EFFECTIVE_DATE) {
+  for (const s of dashData.sessionsAll) {
+    if (!s.lastDate || s.lastDate < cycleStart || s.lastDate > cycleEnd) {
       continue;
     }
-    inputTokens += t.debugPromptTokens || t.promptTokens;
-    outputTokens += t.debugOutputTokens || t.outputTokens;
-    cachedTokens += t.debugCachedTokens || 0;
+    inputTokens += s.actualPrompt || s.prompt || 0;
+    outputTokens += s.actualOutput || s.output || 0;
+    cachedTokens += s.actualCached || 0;
   }
   // Live OTel cache is more reliable for "now" — overlay max so cache count
   // never drops below what the live receiver reports for today.
@@ -339,6 +353,7 @@ export function buildSidebarSnapshot(input: SidebarBuildInput): SidebarSnapshot 
     modelsMore,
     byDow,
     tokens: { input: inputTokens, output: outputTokens, cached: cachedTokens },
+    cacheHitPct: computeCacheHit(inputTokens, cachedTokens).pct,
   };
 
   // ── Sessions: top 30 by credits within cycle ──
