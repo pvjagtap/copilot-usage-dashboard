@@ -75,6 +75,9 @@ function ctxWithSnapshotAge(ageMs) {
     ],
     cdnProviders: {},
     userVendorByModelId: [],
+    // Current schema — otherwise the upgrade path forces a refresh and these
+    // cases can't isolate TTL/miss behaviour.
+    vendorMapVersion: 2,
   };
   return { globalState: { get: () => payload, update: async () => {} } };
 }

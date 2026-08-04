@@ -201,16 +201,35 @@ const cfg = { ...DEFAULT_AIC_CONFIG };
   assert("merged size is exactly 3", merged.size === 3);
 }
 
-// ── Test 9: mergeThirdPartyMaps — vendor disagreement drops the id
+// ── Test 9: mergeThirdPartyMaps — vendor disagreement keeps the id
 {
-  console.log("== Test 9: mergeThirdPartyMaps (disagreement is dropped) ==");
-  // File says model-y → anthropic, but the runtime registry says model-y → openai.
-  // We can't resolve this safely; drop the id and fall back to CAPI/heuristic.
+  console.log("== Test 9: mergeThirdPartyMaps (disagreement → 'multiple') ==");
+  // File says model-y → anthropic, the runtime registry says openai. Neither
+  // input can contain `copilot`, so the id is still definitively not
+  // GitHub-billed — only *which* third party is unclear. Dropping it would
+  // hand the id back to the rate table and wrongly bill it.
   const fileMap = new Map<string, string>([["model-y", "anthropic"]]);
   const lmMap = new Map<string, string>([["model-y", "openai"]]);
   const merged = mergeThirdPartyMaps(fileMap, lmMap);
-  assert("disagreeing id is dropped", !merged.has("model-y"));
-  assert("merged size is 0", merged.size === 0);
+  assert("disagreeing id is retained as third-party", merged.get("model-y") === "multiple");
+  assert("merged size is 1", merged.size === 1);
+}
+
+// ── Test 10: two BYOK vendors declaring the same id stays third-party
+{
+  console.log("== Test 10: parseUserChatLanguageModels (two BYOK vendors, no copilot) ==");
+  // The docs encourage reaching one model through several providers (e.g.
+  // `azure` and `customendpoint`). Copilot is absent, so this must NOT be
+  // treated as an alias collision.
+  const sample = JSON.stringify([
+    { name: "Azure", vendor: "azure", models: [{ id: "claude-sonnet-5" }] },
+    { name: "Direct", vendor: "customendpoint", models: [{ id: "claude-sonnet-5" }] },
+  ]);
+  const map = parseUserChatLanguageModels(sample);
+  assert(
+    "id under two non-Copilot vendors is retained as third-party",
+    map.get("claude-sonnet-5") === "multiple"
+  );
 }
 
 if (failed > 0) {

@@ -262,21 +262,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // OpenAI, Gemini, …), installed/disabled an Ollama-style provider
   // extension, etc. `vscode.lm.selectChatModels()` reflects exactly this
   // set, so we re-read it to keep the third-party id → vendor map current.
+  // VS Code fires this repeatedly while providers register during startup —
+  // seven times in one observed activation — so coalesce into one refresh.
   try {
     if (vscode.lm && typeof vscode.lm.onDidChangeChatModels === "function") {
+      let lmChangeTimer: NodeJS.Timeout | undefined;
       context.subscriptions.push(
         vscode.lm.onDidChangeChatModels(() => {
-          output.appendLine("lm: chat-model registry changed — refreshing model catalog");
-          const enabledNow = vscode.workspace
-            .getConfiguration("copilotUsage.aic")
-            .get<boolean>("useOnlineModelCatalog") ?? true;
-          void loadModelCatalog(context, {
-            enabled: enabledNow,
-            log: m => output.appendLine(m),
-            refreshNow: true,
-          });
+          if (lmChangeTimer) {
+            clearTimeout(lmChangeTimer);
+          }
+          lmChangeTimer = setTimeout(() => {
+            lmChangeTimer = undefined;
+            output.appendLine("lm: chat-model registry changed — refreshing model catalog");
+            const enabledNow = vscode.workspace
+              .getConfiguration("copilotUsage.aic")
+              .get<boolean>("useOnlineModelCatalog") ?? true;
+            void loadModelCatalog(context, {
+              enabled: enabledNow,
+              log: m => output.appendLine(m),
+              refreshNow: true,
+            });
+          }, 5000);
         })
       );
+      context.subscriptions.push({
+        dispose: () => {
+          if (lmChangeTimer) {
+            clearTimeout(lmChangeTimer);
+          }
+        },
+      });
     }
   } catch (err) {
     output.appendLine(`lm: onDidChangeChatModels subscription failed — ${String(err)}`);

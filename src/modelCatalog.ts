@@ -105,6 +105,18 @@ const MISS_REFRESH_MIN_AGE_MS = 15 * 60 * 1000;
 const CATALOG_CACHE_KEY = "copilotUsage.aic.modelCatalog.v1";
 
 /**
+ * Schema version of the persisted `userVendorByModelId` map. Bump whenever
+ * the parser can extract ids a previous build could not, so an upgrade
+ * doesn't sit on a cached map for up to `CATALOG_TTL_MS` still missing them.
+ *
+ *   1 — `settings` keys only.
+ *   2 — also reads the documented `models[]` array, and keeps ids declared
+ *       under several non-Copilot vendors as `"multiple"` instead of
+ *       dropping them.
+ */
+const VENDOR_MAP_VERSION = 2;
+
+/**
  * globalState key for the account-scoped part of the catalog (CAPI rates +
  * CDN provider lists), declared to Settings Sync so every machine signed into
  * the same account converges on one snapshot.
@@ -195,6 +207,14 @@ interface TokenPriceBlock {
 export interface ModelCatalogEntry {
   id: string;
   billable: boolean;
+  /** Declared under a non-Copilot vendor and absent from a loaded CAPI snapshot. */
+  exclusiveThirdParty?: boolean;
+  /**
+   * The user declared this id under a non-Copilot vendor, regardless of
+   * whether CAPI also serves it. Set even on `source: "capi"` entries, so a
+   * colliding id can still be split per request by its routing evidence.
+   */
+  userThirdParty?: boolean;
   multiplier?: number;
   isPremium?: boolean;
   preview?: boolean;
@@ -250,6 +270,8 @@ interface SyncedCatalogPayload {
 
 interface CatalogCachePayload {
   fetchedAt: number;
+  /** `VENDOR_MAP_VERSION` the map was built with; absent on pre-v2 payloads. */
+  vendorMapVersion?: number;
   /** Persisted form of `ModelCatalog.userVendorByModelId`. */
   userVendorByModelId?: Array<[string, string]>;
   /** Pre-split payloads carried the rates here too; read for migration only. */
@@ -438,22 +460,31 @@ export function classifyByCatalog(modelName: string): ModelCatalogEntry | null {
   const capiEntry =
     cached.byId.get(lower) ?? cached.byId.get(normalized) ?? null;
 
+  const thirdPartyVendor =
+    cached.userVendorByModelId.get(lower) ?? cached.userVendorByModelId.get(normalized);
+
   // 1. CAPI says billable → trust CAPI, ignore the BYOK alias collision.
+  //    `userThirdParty` still rides along: when the same id is ALSO declared
+  //    against the user's own key, the row is billable overall but individual
+  //    requests may not be, and only per-request routing evidence can tell.
   if (capiEntry && capiEntry.billable) {
-    return capiEntry;
+    return thirdPartyVendor ? { ...capiEntry, userThirdParty: true } : capiEntry;
   }
 
   // 2. No CAPI billable hit — fall back to the user/runtime third-party
   //    signal. This is where genuine Ollama / LM Studio / BYOK-only ids
   //    (which never appear in CAPI) correctly resolve to non-billable.
-  const thirdPartyVendor =
-    cached.userVendorByModelId.get(lower) ?? cached.userVendorByModelId.get(normalized);
   if (thirdPartyVendor) {
     return {
       id: modelName,
       billable: false,
       vendor: thirdPartyVendor,
+      userThirdParty: true,
       source: "user-config",
+      // Only claim exclusivity when we actually hold a CAPI snapshot to
+      // check against — an empty snapshot (offline / fetch failed) would
+      // otherwise make every id look absent from Copilot's catalog.
+      exclusiveThirdParty: cached.byId.size > 0 && !capiEntry,
     };
   }
 
@@ -494,6 +525,17 @@ export function loadCatalog(
       ? { fetchedAt: local!.fetchedAt, entries: local!.entries!, cdnProviders: local!.cdnProviders ?? {} }
       : undefined;
 
+  // A vendor map written by an older parser is missing ids this build can now
+  // extract (BYOK `models[]`). Its existing entries stay valid — a v1 entry is
+  // always a v2 entry — so hydrate it as-is for an instant answer, but refresh
+  // regardless of TTL to pick up what it couldn't see.
+  const vendorMapStale = (local?.vendorMapVersion ?? 1) !== VENDOR_MAP_VERSION;
+  if (vendorMapStale) {
+    opts.log(
+      `modelCatalog: vendor map schema v${local?.vendorMapVersion ?? 1} < v${VENDOR_MAP_VERSION} — forcing refresh to re-parse chatLanguageModels.json`
+    );
+  }
+
   if (rates) {
     // A snapshot stamped in the future (clock skew across synced machines)
     // would read as permanently fresh, so treat it as expired instead.
@@ -513,7 +555,7 @@ export function loadCatalog(
 
   // 2. Decide whether to refresh from network.
   const fresh = cached && Date.now() - cached.fetchedAt < CATALOG_TTL_MS;
-  if (fresh && !opts.refreshNow) {
+  if (fresh && !opts.refreshNow && !vendorMapStale) {
     return Promise.resolve(cached);
   }
 
@@ -566,41 +608,54 @@ async function refreshFromNetwork(ctx: vscode.ExtensionContext, log: LogFn): Pro
   }
 
   // ── Copilot CAPI /models — AUTHORITATIVE BILLING SOURCE ──────
-  if (capiRes.status === "fulfilled" && capiRes.value) {
-    let ratesParsed = 0;
-    let billableCount = 0;
-    let noRateSample: CapiModelResponse | null = null;
-    for (const m of capiRes.value) {
-      const rates = extractRatesFromCapi(m);
-      if (rates) ratesParsed++;
-      else if (!noRateSample && m.id !== "trajectory-compaction") noRateSample = m;
-      // Billability now comes from rates (input_price > 0), because the
-      // legacy `billing.multiplier` field was removed from CAPI.
-      const billable = !!rates && rates.inputCreditsPerMillion > 0;
-      if (billable) billableCount++;
-      const cat = m.model_picker_price_category;
-      entries.set(m.id.toLowerCase(), {
-        id: m.id,
-        billable,
-        multiplier: rates ? Math.max(0.25, rates.inputCreditsPerMillion / 250) : undefined,
-        isPremium: cat === "high" || cat === "very_high",
-        preview: m.preview ?? false,
-        vendor: m.vendor,
-        rates,
-        contextMax: extractContextMaxFromCapi(m),
-        source: "capi",
-      });
-    }
-    log(
-      `modelCatalog: parsed per-1M rates for ${ratesParsed}/${capiRes.value.length} CAPI models (${billableCount} billable)`
-    );
-    if (ratesParsed === 0 && noRateSample) {
-      // Fired when the response is missing token_prices entirely — usually
-      // means CAPI is serving a legacy schema to our client headers.
+  // Parsing is isolated: a schema change here must not discard the user's
+  // third-party vendor map, which is parsed further down and is what BYOK
+  // classification depends on.
+  try {
+    if (capiRes.status === "fulfilled" && capiRes.value) {
+      let ratesParsed = 0;
+      let billableCount = 0;
+      let noRateSample: CapiModelResponse | null = null;
+      for (const m of capiRes.value) {
+        const rates = extractRatesFromCapi(m);
+        if (rates) ratesParsed++;
+        else if (!noRateSample && m.id !== "trajectory-compaction") noRateSample = m;
+        // Billability now comes from rates (input_price > 0), because the
+        // legacy `billing.multiplier` field was removed from CAPI.
+        const billable = !!rates && rates.inputCreditsPerMillion > 0;
+        if (billable) billableCount++;
+        const cat = m.model_picker_price_category;
+        entries.set(m.id.toLowerCase(), {
+          id: m.id,
+          billable,
+          multiplier: rates ? Math.max(0.25, rates.inputCreditsPerMillion / 250) : undefined,
+          isPremium: cat === "high" || cat === "very_high",
+          preview: m.preview ?? false,
+          vendor: m.vendor,
+          rates,
+          contextMax: extractContextMaxFromCapi(m),
+          source: "capi",
+        });
+      }
       log(
-        `modelCatalog: no-rates sample id=${noRateSample.id} billing=${JSON.stringify(noRateSample.billing).slice(0, 500)}`
+        `modelCatalog: parsed per-1M rates for ${ratesParsed}/${capiRes.value.length} CAPI models (${billableCount} billable)`
       );
+      if (ratesParsed === 0 && noRateSample) {
+        // Fired when the response is missing token_prices entirely — usually
+        // means CAPI is serving a legacy schema to our client headers. Dump
+        // the whole sample: `billing` itself is one of the fields that went
+        // missing, so it is not reliable to inspect on its own.
+        let sample: string;
+        try {
+          sample = JSON.stringify(noRateSample) ?? String(noRateSample);
+        } catch {
+          sample = "<unserialisable>";
+        }
+        log(`modelCatalog: no-rates sample id=${noRateSample.id} raw=${sample.slice(0, 500)}`);
+      }
     }
+  } catch (err) {
+    log(`modelCatalog: CAPI parse failed — ${String(err)} (continuing with other sources)`);
   }
 
   // ── User's chatLanguageModels.json + vscode.lm registry ─ THIRD-PARTY SIGNAL ──
@@ -627,20 +682,41 @@ async function refreshFromNetwork(ctx: vscode.ExtensionContext, log: LogFn): Pro
     return;
   }
 
+  // CAPI occasionally serves the model list with the whole `billing` block
+  // missing (observed: 40 models, 0 with rates). Persisting that would mark
+  // every Copilot model non-billable and collapse all cost reporting, so keep
+  // the rates we already have and take only the third-party map from this
+  // round. A genuinely empty CAPI response is caught by the guard above.
+  let effectiveEntries = entries;
+  if (entries.size > 0 && ![...entries.values()].some(e => e.billable)) {
+    const priorEntries = cached?.byId;
+    if (priorEntries && [...priorEntries.values()].some(e => e.billable)) {
+      log(
+        `modelCatalog: CAPI returned ${entries.size} models with no rates — keeping ${priorEntries.size} previously-priced entries`
+      );
+      effectiveEntries = priorEntries;
+    }
+  }
+
   const next: ModelCatalog = {
     fetchedAt: Date.now(),
-    byId: entries,
+    byId: effectiveEntries,
     cdnProviders,
     userVendorByModelId,
   };
   cached = next;
 
-  const entryList = Array.from(entries.values());
+  const entryList = Array.from(effectiveEntries.values());
   // Machine-local: only the vendor map. Rates live under the synced key so the
   // two are never duplicated and a synced snapshot can never carry a vendor
   // mapping from another machine.
+  // Only claim the new schema when the config file was actually re-parsed —
+  // otherwise an unreadable file would mark the map current and suppress the
+  // forced refresh on every later activation.
   const payload: CatalogCachePayload = {
     fetchedAt: next.fetchedAt,
+    vendorMapVersion:
+      userRes.status === "fulfilled" && userRes.value ? VENDOR_MAP_VERSION : undefined,
     userVendorByModelId: Array.from(userVendorByModelId.entries()),
   };
   await ctx.globalState.update(CATALOG_CACHE_KEY, payload);

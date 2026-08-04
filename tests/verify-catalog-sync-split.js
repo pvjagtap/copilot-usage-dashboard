@@ -61,6 +61,16 @@ function check(name, cond, detail) {
 const log = () => {};
 const now = Date.now();
 
+// `runRefresh()` keeps a module-level in-flight guard, so a refresh left
+// pending by one case would silently suppress the next one's fetch. Stub the
+// network for the whole file (fail fast) and drain the microtask queue between
+// cases that assert on refresh behaviour.
+global.fetch = async () => { throw new Error("offline"); };
+const settle = () => new Promise(r => setTimeout(r, 0));
+
+/** Cases that assert on refresh behaviour — run serially at the end. */
+const refreshCases = [];
+
 // ── 1 + 2 + 3: synced rates arrive, local vendor map survives ────────────
 {
   const ctx = makeCtx({
@@ -149,16 +159,59 @@ const now = Date.now();
     },
   });
 
-  let refreshed = false;
-  const origFetch = global.fetch;
-  global.fetch = async () => { refreshed = true; throw new Error("offline"); };
-  try {
+  refreshCases.push(async () => {
+    let refreshed = false;
+    global.fetch = async () => { refreshed = true; throw new Error("offline"); };
     catalog.loadCatalog(ctx, { enabled: true, log });
-  } finally {
-    global.fetch = origFetch;
-  }
-  check("future-dated snapshot does not suppress refresh", refreshed);
+    await settle();
+    check("future-dated snapshot does not suppress refresh", refreshed);
+  });
 }
 
-console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
-process.exit(failures === 0 ? 0 : 1);
+// ── 6: a vendor map from an older parser forces a refresh ────────────────
+// v1.10.80 could not read BYOK `models[]`, so a fresh-by-TTL cache from that
+// build would otherwise keep BYOK models billable for up to 24h after upgrade.
+refreshCases.push(async () => {
+  const seed = {
+    [LOCAL_KEY]: {
+      fetchedAt: now - 1000,
+      // No `vendorMapVersion` — the v1.10.80 shape.
+      userVendorByModelId: [["llama3", "ollama"]],
+    },
+    [SYNC_KEY]: { fetchedAt: now - 1000, entries: [entry("gpt-5")], cdnProviders: {} },
+  };
+
+  let refreshed = false;
+  global.fetch = async () => { refreshed = true; throw new Error("offline"); };
+  catalog.loadCatalog(makeCtx(seed), { enabled: true, log });
+  check("pre-v2 vendor map forces a refresh despite a fresh TTL", refreshed);
+
+  // The old entries are a strict subset of what v2 produces, so they must
+  // still answer while the refresh is in flight.
+  const hit = catalog.classifyByCatalog("llama3");
+  check("pre-v2 entries still classify during the refresh",
+    !!hit && hit.billable === false && hit.vendor === "ollama",
+    JSON.stringify(hit));
+  await settle();
+
+  // A current map must NOT force a refresh.
+  let refreshed2 = false;
+  global.fetch = async () => { refreshed2 = true; throw new Error("offline"); };
+  const seed2 = {
+    [LOCAL_KEY]: { ...seed[LOCAL_KEY], vendorMapVersion: 2 },
+    [SYNC_KEY]: seed[SYNC_KEY],
+  };
+  catalog.loadCatalog(makeCtx(seed2), { enabled: true, log });
+  await settle();
+  check("current vendor map keeps the TTL short-circuit", !refreshed2);
+});
+
+(async () => {
+  for (const run of refreshCases) {
+    // Let any refresh started by an earlier case clear the in-flight guard.
+    await settle();
+    await run();
+  }
+  console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
+  process.exit(failures === 0 ? 0 : 1);
+})();

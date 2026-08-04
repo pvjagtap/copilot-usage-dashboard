@@ -106,6 +106,14 @@ export interface DebugRequest {
   output: number;
   cached: number;
   nanoAiu: number;
+  /**
+   * `attrs.debugName` — the call site. Copilot-routed requests name the
+   * feature that issued them (`panel/editAgent`, `summarizeConversationHistory`,
+   * `title`, …); requests dispatched through VS Code's public
+   * `LanguageModelChat` API report `copilotLanguageModelWrapper`, which is the
+   * only per-request evidence that a BYOK provider served the call.
+   */
+  debugName?: string;
 }
 
 export interface ToolCall {
@@ -1078,6 +1086,7 @@ function parseDebugLogLines(content: string): ParsedDebugLog | null {
       // call returned), fall back to 0 so we don't regress the turn's existing
       // turn_start timestamp.
       const eventTs = typeof entry.ts === "number" ? entry.ts : 0;
+      const debugName = typeof attrs.debugName === "string" ? attrs.debugName : undefined;
       const debugRequest: DebugRequest = {
         timestamp: eventTs ? new Date(eventTs).toISOString() : "",
         model: reqModel,
@@ -1085,6 +1094,7 @@ function parseDebugLogLines(content: string): ParsedDebugLog | null {
         output: out,
         cached,
         nanoAiu,
+        debugName,
       };
       totalPrompt += inp;
       totalOutput += out;

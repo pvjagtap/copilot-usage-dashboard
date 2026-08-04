@@ -5,6 +5,141 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.83] - 2026-08-04
+
+### Fixed
+
+- **A model id served by both Copilot and your own API key was billed for
+  every call, including the ones your key paid for.** `claude-opus-5` and
+  `claude-sonnet-5` are sold by Copilot *and* declared in this user's
+  `chatLanguageModels.json` against an Azure Foundry endpoint. v1.10.81 only
+  demotes ids that Copilot's CAPI does not serve at all, so a colliding id was
+  deliberately left billable — correct for the whole row, wrong for the BYOK
+  half of it. No amount of model-name matching can separate them, because the
+  name is genuinely the same on both routes.
+
+  Classification is now per request. Copilot Chat stamps
+  `debugName: "copilotLanguageModelWrapper"` on calls dispatched through
+  VS Code's public `LanguageModelChat` API — the path a BYOK provider is
+  reached by — while its own routes name the calling feature
+  (`panel/editAgent`, `summarizeConversationHistory`, `title`). The scanner
+  now records that marker, and a request carrying it is non-billable when the
+  model is declared under a non-Copilot vendor. Requests GitHub actually
+  billed still short-circuit to billable first, so no real charge can be
+  hidden, and the marker alone cannot demote a model you never configured as
+  BYOK.
+
+  Verified against the full debug-log history: the marker appears on exactly
+  the two BYOK models and nothing else, and all 357 such requests reported
+  zero credits, while the same models' 564 Copilot-routed requests are
+  untouched.
+
+- The live "today" panel hardcoded `hasActualCredits: true` on every model
+  row, which forced a row to billable before any of the above could apply. It
+  is now false for rows made up entirely of unbilled BYOK calls.
+
+- **The catalog refresh crashed before it could write the vendor map, so
+  v1.10.82's schema-version fix retried forever and never completed.** A
+  diagnostic log line called `JSON.stringify(m.billing).slice(...)`, but CAPI
+  has since dropped `billing` — `JSON.stringify(undefined)` returns
+  `undefined`, and `.slice` on it throws. The throw escaped to the top-level
+  handler, which logged `refresh failed silently` and abandoned the whole
+  refresh, including the `chatLanguageModels.json` parse. Every activation
+  re-detected the stale v1 map, re-refreshed, and crashed at the same point.
+
+  The log line no longer assumes that field exists, and CAPI parsing is now
+  isolated in its own try/catch so a future schema change degrades to "no
+  rates" instead of taking the third-party vendor map down with it.
+
+- **BYOK classification could not fire for the very ids it targets.**
+  `classifyByCatalog` resolves an id served by both Copilot and a BYOK key in
+  favour of CAPI, returning `source: "capi"` — so the new per-request rule,
+  which tested `source === "user-config"`, was unreachable for exactly the
+  colliding case. Entries now carry a separate `userThirdParty` flag that
+  survives the CAPI branch, and the classifier keys off that. The unit tests
+  mocked the lookup and so could not catch this; the suite now also drives the
+  real `classifyByCatalog` end to end.
+
+- **A rate-less CAPI response would have wiped out all billing data.** CAPI is
+  currently returning 40 models with no `billing` block at all, so every entry
+  parses as non-billable. The existing "keep previous cache" guard only trips
+  when *every* source is empty, which 40 entries is not — so once the crash
+  above was fixed, the first successful refresh would have persisted a catalog
+  in which no Copilot model is billable, collapsing all cost reporting to
+  zero. A refresh that returns models but not a single priced one now keeps
+  the previously-priced entries and takes only the third-party map from that
+  round.
+
+- `onDidChangeChatModels` fired seven times during a single activation, each
+  triggering a full network refresh. It is now debounced by 5s, which also
+  resolves the race where the registry was enumerated mid-population and
+  reported 0 non-Copilot ids from 58 registered models.
+
+## [1.10.82] - 2026-08-03
+
+### Fixed
+
+- **The v1.10.81 BYOK fix could stay dormant for up to 24 hours after upgrade.**
+  The third-party vendor map is cached in `globalState` and hydrated on
+  activation, and a snapshot inside the 24h TTL short-circuits the network
+  refresh entirely. A map written by v1.10.80's parser therefore had no BYOK
+  `models[]` ids in it, so the new classifier had nothing to act on and those
+  models kept counting as billable until the TTL happened to expire.
+
+  The map now carries a `vendorMapVersion`. When it predates the running
+  build's parser, the TTL short-circuit is bypassed and
+  `chatLanguageModels.json` is re-parsed on the next activation. Cached
+  entries still hydrate and classify while that refresh is in flight — a v1
+  entry is always a valid v2 entry, only incomplete — so there is no window
+  where previously-known third-party models read as billable. The new version
+  is stamped only when the config file was actually re-read, so an unreadable
+  file cannot mark the map current and permanently suppress the retry.
+
+- Covered by new cases in `tests/verify-catalog-sync-split.js`. That suite's
+  refresh assertions now run serially and drain the module-level in-flight
+  guard between cases, which was masking whether a refresh had been triggered.
+
+## [1.10.81] - 2026-08-03
+
+### Fixed
+
+- **BYOK models were billed as Copilot usage.** Models added through the
+  documented Bring-Your-Own-Key flow (built-in providers and Custom Endpoint)
+  were counted against AI Credits, inflating the headline total and projected
+  spend. Two independent defects had to line up for this:
+
+  1. **The `models[]` array was never parsed.** `chatLanguageModels.json`
+     carries model ids in two shapes — `settings` (per-model *option*
+     overrides, in practice only used by the Copilot entry) and `models[]`
+     (the documented BYOK declaration array). The parser only read `settings`,
+     so a BYOK provider's ids never entered the third-party map at all.
+     `models[].id` is now read alongside `settings`.
+
+  2. **A rate-table name collision promoted them back to billable.** Even once
+     parsed, ids like `claude-opus-5` and `claude-sonnet-5` exist verbatim in
+     the built-in rate table because Copilot ships models with the same names.
+     `isKnownGHCModel()` matched first and short-circuited to billable before
+     the third-party signal was ever consulted. The catalog now emits an
+     `exclusiveThirdParty` verdict — set only when the user declared a
+     non-Copilot vendor for the id *and* a successfully-loaded CAPI snapshot
+     does not serve it — which lets the classifier skip the rate-table
+     promotion. Pure alias collisions, where CAPI *does* serve the id, keep the
+     v1.10.15 behaviour and stay billable, so OMP / Pi / CLI totals are
+     unaffected.
+
+- **One model reached through two BYOK providers fell back to billable.** An id
+  declared under two non-Copilot vendors (e.g. the same model via both `azure`
+  and `customendpoint`, which the docs actively encourage) was dropped as
+  "ambiguous" and handed back to the rate table. Ambiguity only matters for
+  *billability*, so it now hinges solely on whether `copilot` is one of the
+  vendors: multiple third-party vendors resolve to `"multiple"` and stay
+  non-billable, while a genuine Copilot/BYOK collision is still deferred to
+  CAPI. Same rule applied to `mergeThirdPartyMaps()`, where a file-vs-runtime
+  vendor disagreement previously dropped the id.
+
+- Covered by `tests/verify-byok-custom-endpoint.js` (built from a real user
+  config) plus updated cases in `tests/verify-catalog-lookup.ts`.
+
 ## [1.10.80] - 2026-08-03
 
 ### Added

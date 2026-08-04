@@ -7,7 +7,8 @@
  * resolution lives in `modelCatalog.ts/readUserChatLanguageModels()` which
  * calls this function with the file's text.
  *
- * File schema (observed; not formally published by VS Code):
+ * File schema — two distinct shapes carry model ids, and BYOK uses the
+ * second one:
  *   [
  *     {
  *       "name":   "Copilot",
@@ -15,27 +16,43 @@
  *       "settings": { "<modelId>": { ...per-model opts... }, ... }
  *     },
  *     {
- *       "name":   "Ollama",
- *       "vendor": "ollama",
- *       "url":    "http://localhost:11434"
+ *       "name":   "Azure Foundry Anthropic",
+ *       "vendor": "customendpoint",
+ *       "apiKey": "${input:chat.lm.secret.-27b7acf0}",
+ *       "models": [ { "id": "claude-opus-5", "name": "…", "url": "…" }, … ]
  *     },
  *     ...
  *   ]
  *
  *  • `vendor === "copilot"` means GitHub bills it; anything else
- *    (ollama, lmstudio, anthropic, openai, …) is third-party / not billed.
- *  • `settings` keys are the model ids the user has explicitly configured
- *    under that vendor. Providers that enumerate models at runtime
- *    (Ollama, LM Studio) typically have no `settings` block — we simply
- *    won't have a third-party entry for those ids and the classifier
- *    falls through to its existing `isKnownGHCModel()` heuristic.
+ *    (customendpoint, ollama, lmstudio, anthropic, openai, azure, …) is
+ *    third-party / not billed.
+ *  • `settings` keys are per-model *option* overrides — in practice only the
+ *    Copilot entry uses this block.
+ *  • `models[]` is the documented BYOK declaration array (built-in providers
+ *    and Custom Endpoint). Ignoring it was why BYOK ids such as
+ *    `claude-opus-5` were never recorded as third-party and instead got
+ *    priced by the rate table's family fallback as Copilot premium traffic.
+ *  • Providers that enumerate models at runtime (Ollama, LM Studio) may have
+ *    neither block — those are covered by the `vscode.lm` registry reader in
+ *    `modelCatalog.ts`, and otherwise fall through to `isKnownGHCModel()`.
+ *
+ * See <https://code.visualstudio.com/docs/agent-customization/language-models>
+ * ("Model configuration reference").
  */
+
+interface UserChatProviderModelEntry {
+  id?: string;
+  name?: string;
+  url?: string;
+}
 
 interface UserChatProviderEntry {
   name?: string;
   vendor?: string;
   url?: string;
   settings?: Record<string, unknown>;
+  models?: UserChatProviderModelEntry[];
 }
 
 /**
@@ -72,12 +89,22 @@ export function parseUserChatLanguageModels(rawJson: string): Map<string, string
     if (!vendor) {
       continue;
     }
+
+    const ids: string[] = [];
     const settings = entry.settings;
-    if (!settings || typeof settings !== "object") {
-      continue;
+    if (settings && typeof settings === "object") {
+      ids.push(...Object.keys(settings));
     }
-    for (const rawId of Object.keys(settings)) {
-      const id = rawId.toLowerCase();
+    if (Array.isArray(entry.models)) {
+      for (const m of entry.models) {
+        if (typeof m?.id === "string") {
+          ids.push(m.id);
+        }
+      }
+    }
+
+    for (const rawId of ids) {
+      const id = rawId.trim().toLowerCase();
       if (!id) {
         continue;
       }
@@ -88,15 +115,18 @@ export function parseUserChatLanguageModels(rawJson: string): Map<string, string
   }
 
   // Second pass: keep unambiguous third-party associations only.
+  //
+  // Ambiguity is only about *billability*, so it hinges solely on whether
+  // `copilot` is one of the vendors. An id declared under two BYOK vendors
+  // (e.g. the same model reached via both `azure` and `customendpoint`, which
+  // the docs actively encourage) is still unambiguously not-GitHub-billed —
+  // dropping it would send it back to the rate table and bill it.
   for (const [id, vendors] of idToVendors) {
-    if (vendors.size !== 1) {
-      continue; // ambiguous — listed under multiple vendors
+    if (vendors.has("copilot")) {
+      continue; // billable, or a Copilot/BYOK alias collision — let CAPI decide
     }
     const [vendor] = vendors;
-    if (vendor === "copilot") {
-      continue; // billable, not third-party
-    }
-    out.set(id, vendor);
+    out.set(id, vendors.size === 1 ? vendor : "multiple");
   }
   return out;
 }
@@ -107,8 +137,10 @@ export function parseUserChatLanguageModels(rawJson: string): Map<string, string
  *
  * Rules:
  *  • If both sources agree on the same non-Copilot vendor for an id, keep it.
- *  • If they disagree, DROP the id (safer than picking arbitrarily — the
- *    classifier falls back to the CAPI billing entry / heuristic).
+ *  • If they disagree, keep the id under `"multiple"`. Neither input can
+ *    contain `copilot` (both producers filter it out), so a disagreement is
+ *    still unambiguous evidence that the id is not GitHub-billed — dropping
+ *    it would hand the id back to the rate table and bill it.
  *  • If only one source has the id, keep that mapping.
  */
 export function mergeThirdPartyMaps(
@@ -121,7 +153,7 @@ export function mergeThirdPartyMaps(
     if (existing === undefined) {
       out.set(id, vendor);
     } else if (existing !== vendor) {
-      out.delete(id);
+      out.set(id, "multiple");
     }
     // else: same vendor in both sources — keep as-is.
   }

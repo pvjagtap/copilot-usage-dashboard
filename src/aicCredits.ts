@@ -392,6 +392,23 @@ export class AICCalculator {
   * up and treat the model as unknown.
    */
   findModelRate(modelName: string): ModelCostRate | null {
+    const explicit = this._findExplicitRate(modelName);
+    if (explicit) {
+      return explicit;
+    }
+
+    const normalized = modelName.toLowerCase().replace(/(\d)-(\d)/g, "$1.$2");
+
+    // Reaching here means the snapshot may predate this model — let the
+    // catalog decide whether that warrants an out-of-band refresh.
+    notifyUnknownModel(modelName);
+
+    // 3) Family fallback — price an unseen point release from its family.
+    return this._findFamilyRate(normalized);
+  }
+
+  /** Rate lookup restricted to authoritative sources — no family guessing. */
+  private _findExplicitRate(modelName: string): ModelCostRate | null {
     // 1) Live CAPI catalog — authoritative and self-updating.
     const live = getRatesFor(modelName);
     if (live) return live;
@@ -420,16 +437,7 @@ export class AICCalculator {
         bestLen = key.length;
       }
     }
-    if (bestMatch) {
-      return bestMatch;
-    }
-
-    // Reaching here means the snapshot may predate this model — let the
-    // catalog decide whether that warrants an out-of-band refresh.
-    notifyUnknownModel(modelName);
-
-    // 3) Family fallback — price an unseen point release from its family.
-    return this._findFamilyRate(normalized);
+    return bestMatch;
   }
 
   /**
@@ -922,10 +930,48 @@ export function createCalculatorFromConfig(config: AICConfig): AICCalculator {
  */
 export type CatalogLookup = (
   modelName: string,
-) => { billable: boolean; source?: "capi" | "user-config" } | null;
+) => {
+  billable: boolean;
+  source?: "capi" | "user-config";
+  /**
+   * The user declared a non-Copilot vendor for this id AND a loaded CAPI
+   * snapshot does not serve it at all — so it cannot be a Copilot alias.
+   */
+  exclusiveThirdParty?: boolean;
+  /**
+   * The user declared a non-Copilot vendor for this id. Unlike
+   * `exclusiveThirdParty` this is also set when CAPI serves the id too, which
+   * is precisely the case that must be split by per-request evidence.
+   */
+  userThirdParty?: boolean;
+} | null;
+
+/**
+ * `attrs.debugName` value Copilot Chat stamps on requests dispatched through
+ * VS Code's public `LanguageModelChat` API — i.e. served by a BYOK provider
+ * rather than Copilot's own routes, which instead name the calling feature
+ * (`panel/editAgent`, `summarizeConversationHistory`, `title`, …).
+ */
+const BYOK_WRAPPER_DEBUG_NAME = "copilotlanguagemodelwrapper";
+
+/**
+ * Whether a request's `debugName` proves a BYOK provider served it.
+ *
+ * This is the only per-request routing evidence available when a model id is
+ * served by BOTH Copilot and a BYOK key (e.g. `claude-opus-5`), where the id
+ * alone cannot decide. Verified against real debug logs: every
+ * `copilotLanguageModelWrapper` request reported zero `copilotUsageNanoAiu`,
+ * while the same models' Copilot-routed requests reported real credits.
+ */
+export function isByokWrapperCall(debugName?: string): boolean {
+  return (debugName || "").trim().toLowerCase() === BYOK_WRAPPER_DEBUG_NAME;
+}
 
 function isCopilotSourceHint(sourceHint?: string): boolean {
   const lower = (sourceHint || "").toLowerCase();
+  if (isByokWrapperCall(lower)) {
+    return false;
+  }
   return lower.includes("github") || lower.includes("copilot");
 }
 
@@ -944,6 +990,7 @@ export function classifyModelBillability(
 ): boolean {
   const lower = (modelName || "").toLowerCase();
   const isCopilotRouted = isCopilotSourceHint(sourceHint) || isCopilotResolvedModelId(modelName);
+  const viaByokWrapper = isByokWrapperCall(sourceHint);
 
   // 1. Explicit exclude wins over everything else (lets the user mark a
   //    particular alias as informational even if the rate table knows it).
@@ -970,32 +1017,48 @@ export function classifyModelBillability(
     return true;
   }
 
+  // 4b. Per-request routing evidence. When the id is declared under a
+  //     non-Copilot vendor AND this particular request went out through the
+  //     public LanguageModelChat wrapper, a BYOK provider served it — even if
+  //     Copilot's CAPI also sells the same id. This is what splits a colliding
+  //     model (`claude-opus-5`) into its billed and unbilled halves instead of
+  //     forcing the whole row one way. Requests that carried real credits
+  //     already returned at step 2.
+  if (viaByokWrapper && catalogLookup?.(modelName)?.userThirdParty === true) {
+    return false;
+  }
+
   // 5. GitHub/Copilot model names must not land in the non-billable bucket.
   //    Pre-June-1 usage is filtered by date before this function is called;
   //    for in-window rows, known Copilot models are billable unless the user
   //    explicitly excluded them above.
-  if (calculator.isKnownGHCModel(modelName)) {
+  //
+  //    Skipped when the catalog reports an EXCLUSIVE third-party vendor for
+  //    this id — a provider the user declared in `chatLanguageModels.json`
+  //    that Copilot's own CAPI does not serve. That is the only signal strong
+  //    enough to prove the id never touched a GitHub-billed route, so the
+  //    rate-table name collision (`claude-opus-5` / `claude-sonnet-5` also
+  //    exist as Copilot models) must not promote it. Alias collisions where
+  //    CAPI *does* serve the id keep `exclusiveThirdParty` unset and stay
+  //    billable, preserving the v1.10.15 OMP/Pi/CLI fix.
+  const hit = catalogLookup?.(modelName) ?? null;
+  const exclusiveThirdParty = hit?.exclusiveThirdParty === true && !isCopilotRouted;
+
+  if (!exclusiveThirdParty && calculator.isKnownGHCModel(modelName)) {
     return true;
   }
 
   // 6. Authoritative online catalog (CDN manifest + Copilot CAPI /models).
-  if (catalogLookup) {
-    const hit = catalogLookup(modelName);
-    if (hit) {
-      // 5a. CAPI verdict is authoritative — GitHub itself told us.
-      if (hit.source === "capi") {
-        return hit.billable;
-      }
-      if (isCopilotRouted) {
-        return true;
-      }
-      // 5b. user-config / BYOK alias verdict. Only honour a demotion if the
-      //     id is genuinely unknown to the rate table; otherwise a Copilot-
-      //     billed id (claude-opus-4.7, gpt-5.4, …) the user happens to also
-      //     have configured as a BYOK alias would wrongly collapse OMP / Pi
-      //     / CLI totals (which carry `hasActualCredits=false` by design).
+  if (hit) {
+    // 6a. CAPI verdict is authoritative — GitHub itself told us.
+    if (hit.source === "capi") {
       return hit.billable;
     }
+    if (isCopilotRouted) {
+      return true;
+    }
+    // 6b. user-config / BYOK verdict for an id the rate table doesn't claim.
+    return hit.billable;
   }
 
   // 7. Copilot-routed opaque resolved ids are billable even before the

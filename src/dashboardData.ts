@@ -7,7 +7,7 @@ import { ScanResult, Session, Turn, ToolCall, Subagent, ScanStats, DebugRequest 
 import { AgentScanResult } from "./agentScanner";
 import { CliScanResult } from "./cliScanner";
 import { LiveStats, OTelRequest } from "./otelReceiver";
-import { AICCalculator, AICConfig, DEFAULT_AIC_CONFIG, createCalculatorFromConfig, getPromoInfo, classifyModelBillability } from "./aicCredits";
+import { AICCalculator, AICConfig, DEFAULT_AIC_CONFIG, createCalculatorFromConfig, getPromoInfo, classifyModelBillability, isByokWrapperCall } from "./aicCredits";
 import { classifyByCatalog, getCachedCatalog } from "./modelCatalog";
 import { MachineView } from "./machineSync";
 import { computeCacheHit } from "./cache";
@@ -924,6 +924,17 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         row.aicCredits += req.nanoAiu / 1e9;
       }
 
+      // A model served by BOTH Copilot and a BYOK key produces one row here.
+      // Only claim actual credits when some request in it was really billed —
+      // otherwise a purely-BYOK row short-circuits to billable downstream.
+      const byokOnlyModels = new Set<string>();
+      for (const [model] of byModelMap) {
+        const reqs = debugRequestsToday.filter(r => r.model === model);
+        if (reqs.length > 0 && reqs.every(r => r.nanoAiu === 0 && isByokWrapperCall(r.debugName))) {
+          byokOnlyModels.add(model);
+        }
+      }
+
       const mostRecentRequest = latestDebugRequest(debugRequestsToday);
       liveOtel = {
         requests,
@@ -937,10 +948,10 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         byModel: Array.from(byModelMap.values()).map(row => ({
           ...row,
           aicCredits: Math.round(row.aicCredits * 100) / 100,
-          // Every row here was built from `debugRequestsToday`, whose AIC
-          // value came from `req.nanoAiu` (GitHub's authoritative billed
-          // amount) — by construction every row has actual credits.
-          hasActualCredits: true,
+          // Rows here come from `req.nanoAiu` (GitHub's authoritative billed
+          // amount), so they carry actual credits — except rows made up
+          // entirely of BYOK-wrapper calls, which GitHub never billed.
+          hasActualCredits: !byokOnlyModels.has(row.model),
           // Backfilled by the post-processor below.
           isBillable: false,
           cacheHitPct: 0,
@@ -1257,7 +1268,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           cachedTokens: req.cached,
           date,
           actualCredits: hasNano ? req.nanoAiu / 1_000_000_000 : undefined,
-          billable: classify(req.model, hasNano),
+          billable: classify(req.model, hasNano, req.debugName),
         });
       }
     } else if (t.timestamp && t.debugByModel) {
