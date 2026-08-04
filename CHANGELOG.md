@@ -5,6 +5,131 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.80] - 2026-08-03
+
+### Added
+
+- **Cost column in the Systems table.** Each system now shows its credits
+  converted to money at the configured `overageCostPerCredit` rate, with a
+  combined cost in the footer.
+- **Combined overage.** A footer row converts the *combined* credits above the
+  account allowance into dollars. The credit budget is an account allowance
+  rather than a per-machine one, so this is the only chargeable figure in the
+  table — the per-system amounts are gross value at the same rate, and the
+  panel note says so.
+
+## [1.10.79] - 2026-08-03
+
+### Added
+
+- **Cross-machine usage — "Systems" table.** Every machine signed into the same
+  account now publishes a compact rollup of its own usage (credits by day and
+  by model, session/turn counts, token totals) over Settings Sync. A new
+  **Systems — Combined Usage** table under the AI Credits section lists each
+  contributing machine as *System 1*, *System 2*, … with its host name, credits
+  for the cycle, counters, and a **last seen** timestamp, plus a combined total.
+  Only rollups are shared — sessions, prompts, tool calls and log contents never
+  leave the machine that produced them.
+- **Dormant-system warning.** A machine with no update in over 7 days is
+  labelled `dormant`, so a laptop that has been switched off cannot quietly
+  distort the combined figure. Rollups reported against a different billing
+  cycle are marked `other cycle` and excluded from the total.
+
+### Changed
+
+- **Headline tiles stay this-machine-only.** *AI Credits Spent*, the budget bar
+  and the projection continue to describe the local machine, so they remain
+  reconcilable against local data. The cross-machine figure is shown
+  explicitly in the Systems table rather than silently folded into the
+  headline.
+- **Settings Sync keys are declared from one place.** `setKeysForSync` replaces
+  an extension's whole declared-key list rather than appending to it, so a
+  second caller would have silently dropped the first one's key. Registration
+  moved out of `modelCatalog` into `machineSync.registerSyncKeys()`, which
+  declares both the catalog and usage keys together on every activation.
+
+### Technical
+
+- Usage is stored as a map keyed by `vscode.env.machineId`, and each machine
+  re-reads that map before overlaying **only its own slot**. VS Code applies
+  incoming extension state per key with a plain replace and offers no merge or
+  conflict resolution, so a single flat usage blob would let whichever machine
+  synced last erase the others.
+- Daily history is trimmed to 120 days per machine and writes are throttled to
+  one per 5 minutes (and skipped entirely when nothing changed) — repeated
+  `globalState` writes can trip the sync service's `LocalTooManyRequests`
+  guard, which suspends auto-sync until VS Code restarts.
+- New `tests/verify-machine-usage-sync.js` (21 checks) pins the invariants:
+  foreign slots are byte-identical after a local publish, System numbering is
+  derived from `firstSeen` so it is the same on every machine, dormant
+  detection, cycle-matched totals, retention trimming, and the write throttle.
+
+## [1.10.78] - 2026-08-03
+
+### Added
+
+- **Model catalog now syncs across machines.** The CAPI rate card and CDN
+  provider lists are stored under a dedicated `globalState` key that is
+  declared to VS Code Settings Sync, so every machine signed into the same
+  account converges on one catalog snapshot instead of each rebuilding its
+  own. Requires Settings Sync to be on with **Extensions** included in the
+  synced resources.
+
+### Changed
+
+- The catalog cache is split in two. `userVendorByModelId` — derived from this
+  machine's `chatLanguageModels.json` and its live `vscode.lm` registry — stays
+  machine-local and is never synced. Syncing it would tag a model as
+  third-party on a machine where no such provider is configured, flipping rows
+  between billable and non-billable.
+- A catalog snapshot stamped in the future (clock skew between synced machines)
+  is now treated as expired rather than permanently fresh.
+
+## [1.10.77] - 2026-08-02
+
+### Fixed
+
+- **Non-billable usage invented spend for third-party models that report no cost.** The "Non-billable models (informational)" panel showed 333.42 credits for August against a real agent-ledger total of 238.22. The extra 95.20 was a single row — `kimi-azure/Kimi-K2.5` — that has no `usage.cost.total` in its session log, so the agent block fell through to `calculator.calculateCredits(...)` and priced 1.16M Azure-hosted Kimi tokens with GitHub's Copilot rate card. That fallback exists for Copilot-routed sessions that predate the cost field; applying it to a third-party provider produces a number with no referent.
+  - Agent-session credits are now sourced by provider: anything not routed through GitHub uses the provider's own cost ledger and nothing else. A third-party model with no ledger entry contributes no credits and no row, rather than a fabricated estimate.
+  - The rate-card fallback is unchanged for `github-copilot` traffic, where GitHub's rates are by definition the correct ones.
+  - Worth noting that the rate card was not merely unavailable for these rows, it was wrong where it *could* be checked: on the same day it estimated 141.12 credits for a Claude Opus row whose ledger says 178.97, and 33.20 against a ledger of 43.34. A plausible-looking number is not a correct one.
+  - Covered by `tests/verify-thirdparty-no-rate-estimate.js`.
+
+- **The non-billable panel described itself inaccurately.** Its blurb claimed every number was a "rate-table estimate of what the equivalent Copilot traffic would cost", and every column was suffixed `(est)`. That has not been true for agent sessions since the change above: those totals are the cost the provider actually billed. The copy now states that the values are AI credits rather than tokens, that agent totals come from the provider's own ledger with the rate table used only as a fallback, and that the input/output/cached split is apportioned from token counts.
+
+- **Every agent row attributed 100% of its credits to Input.** Agent credit entries were pushed with `inputTokens: 0, outputTokens: 0, cachedTokens: 0`, which sends `computeSummary()` down its all-input fallback — so a Claude Opus row built from 27 input tokens and 1.13M cache reads rendered as Input 178.97 / Output 0.00 / Cached 0.00. The real token counts are now carried through, and since the split is scaled to `actualCredits` the total is unaffected. Vendor-prefixed ids resolve for this purpose (`azure-anthropic-foundry/claude-opus-4-7` → `claude-opus-4.7`); ids with no rate match keep the old fallback.
+
+## [1.10.76] - 2026-08-02
+
+### Fixed
+
+- **The model catalog refreshed on a timer instead of on evidence of change.** The catalog is already a persistent, update-only-on-success store — it lives in `globalState`, hydrates synchronously at activation, survives restarts, and a refresh that returns nothing is discarded rather than overwriting the previous snapshot. What was missing is that `CATALOG_TTL_MS` drove refreshes purely by *age*: a snapshot taken at 09:00 counts as fresh all day, so a model GitHub enables at 14:00 stays unresolvable until tomorrow. That window is precisely where the v1.10.74 `claude-opus-5` mispricing came from, and no amount of caching can close it, because the cache is a snapshot of a set that grows without notice.
+  - `notifyUnknownModel()` now forces an out-of-band refresh when `findModelRate()` reaches the family-fallback stage — i.e. when neither the live snapshot nor the static rate table could resolve an id. A miss is the only direct signal available that the snapshot predates a shipped model.
+  - Debounced three ways so this cannot become a fetch storm: each id reports at most once per session, only one refresh runs at a time (`runRefresh()` now guards the activation path too), and a snapshot younger than 15 minutes is trusted as-is. The age guard is also what keeps permanently-unresolvable local/BYOK ids (`ollama/…`, `local-…`) from retriggering fetches — they are never in CAPI, so a refetch would never resolve them.
+  - Respects the `copilotUsage.aic.useOnlineModelCatalog` kill switch: disabling it clears the stored context, so misses trigger nothing at all.
+
+### Added
+
+- `tests/verify-catalog-miss-refresh.js` — pins the debounce rules with a counting `fetch` stub and no network: no refresh before load, none against a fresh snapshot, none for an unresolvable local id, one forced refresh against a 20-minute snapshot, no second refresh for a repeat id, previous rates surviving a failed refresh, and no refresh at all when the kill switch is off.
+
+## [1.10.74] - 2026-08-02
+
+### Fixed
+
+- **"Non-billable models (informational)" panel ignored the selected date range.** Every other table in the AIC card is filtered by the range picker (`byDay` for the calendar, session aggregation for the model breakdown), but the non-billable panel rendered `aic.nonBillable.byModel` verbatim — a whole-billing-cycle aggregate. Selecting *Last 7 days*, *Yesterday*, or a past month left the panel (and its "Non-billable total") showing full-cycle numbers next to range-filtered billable numbers, so the two tables silently disagreed about the window they covered.
+  - `CreditSummary.nonBillable` now carries `byDay` (day → model → `CreditUsage`), populated in the same `computeSummary` loop that fills `nonBillable.byModel`, so the two reconcile exactly by construction.
+  - `AICDashboardData.nonBillable.byDay` flattens it to serializable `{ day, model, tier, …credits }` rows, and `renderAIC` re-aggregates them against the active `bounds` — same filter the calendar and daily totals use. `byModel` is kept as a back-compat fallback for cached payloads that predate `byDay`.
+- **`claude-opus-5` was misclassified as a non-billable model, priced with the wrong rate, and badged `base`.** It was missing from `DEFAULT_MODEL_COSTS`, so whenever the live CAPI catalog was unavailable (kill switch off, stale 24h cache, failed refresh, or a model newer than the last catalog fetch) `findModelRate()` returned `null`. Three separate things then went wrong at once: `calculateCredits()` fell back to gpt-4.1 rates (200/800 instead of 500/2500), the tier defaulted to `base` instead of `premium`, and — worst — `isKnownGHCModel()` returned `false`, which sent every `claude-opus-5` request lacking a `copilotUsageNanoAiu` field into the "Non-billable models (informational)" panel. That is where the `claude-opus-5 — base — 0.00` row came from, sitting directly beneath a `claude-opus-5 — premium — 1394.53` row in the billed table.
+  - Added the models the live catalog lists but the offline table lacked: `claude-opus-5` (500/2500, premium) and `grok-4.5` (200/600, base).
+  - **Family fallback in `findModelRate()`** — a hardcoded table cannot keep pace with GitHub's release cadence, so an unmatched id now inherits the newest rate from its own family before being declared unknown: `claude-opus-6` → `claude-opus-5`, `gpt-5.7-codex` → `gpt-5.3-codex`, `gemini-4.0-flash` → `gemini-3.6-flash`, `gpt-5.9-mini` → `gpt-5.4-mini`. The observed id is preserved for display, only the rates and tier are borrowed. Every model GitHub ships between extension releases is therefore priced approximately right and, critically, stays *billable* instead of being dumped into the informational panel.
+  - The fallback requires a version tail, and permits a bare integer tail only when the family has two or more segments — so short BYOK aliases (`gpt-4`, `gpt-5`, `claude`) and local ids (`ollama/qwen2.5-coder:7b`, `local-llama-13b-q4`) still resolve to `null`, preserving the provider guard from v1.10.x.
+- **Zero-credit rows in the non-billable table.** With the resolution bug above fixed, a genuinely zero row can still occur (a cancelled turn that reports no tokens). Rows below `0.005` credits are now dropped from display; they remain in the underlying data so totals are unaffected.
+
+### Added
+
+- **`tests/verify-nonbillable-range.js`** — pins `sum(nonBillable.byDay) === nonBillable.totalCredits`, that a single-day range yields a strict subset of the cycle total, that an unbounded range reproduces it, and that zero-credit rows stay in the data but out of the rendered table.
+- **`tests/verify-model-family-fallback.js`** — pins that `claude-opus-5` / `grok-4.5` resolve from the offline table, that six unseen point releases inherit the right family rate and tier while keeping their own display name, that the five short-alias/local ids still fail to resolve, that an unseen release classifies as billable while `ollama/*` does not, and that family rates (not gpt-4.1 defaults) are what price real traffic.
+
 ## [1.10.73] - 2026-08-02
 
 ### Changed

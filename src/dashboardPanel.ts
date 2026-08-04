@@ -1073,35 +1073,130 @@ function renderAIC(aic, bounds, filteredSessions) {
   // Non-billable models panel (issue #5)
   // Surfaces local Ollama / LM Studio / BYOK / unrecognised model usage as
   // informational rows so users can see capacity-planning numbers without
-  // those rows inflating the billed total above. Credits shown here are
-  // rate-table ESTIMATES of what the same traffic would cost on Copilot —
-  // NOT what the user will be charged.
+  // those rows inflating the billed total above. Values are AI credits
+  // (1 credit = $0.01): the provider's own billed cost where the agent
+  // ledger supplies one, a Copilot rate-table estimate otherwise.
   let nonBillableHTML = '';
   const nb = aic.nonBillable;
-  if (nb && nb.byModel && nb.byModel.length > 0) {
-    let nbRows = '';
-    nb.byModel.forEach(m => {
-      const tierBadge = m.tier === 'premium'
-        ? '<span class="mult-badge mult-high">premium</span>'
-        : m.tier === 'base'
-          ? '<span class="mult-badge mult-1">base</span>'
-          : '<span class="mult-badge">custom</span>';
-      nbRows += '<tr><td><span class="model-tag '+mc(m.model)+'">'+esc(m.model)+'</span> '+tierBadge+'</td>'
-        + '<td class="num">'+m.inputCredits.toFixed(2)+'</td>'
-        + '<td class="num">'+m.outputCredits.toFixed(2)+'</td>'
-        + '<td class="num cached">'+m.cachedCredits.toFixed(2)+'</td>'
-        + '<td class="num" style="color:var(--muted)">'+m.totalCredits.toFixed(2)+'</td></tr>';
-    });
-    nonBillableHTML = '<div style="margin-top:16px;padding-top:12px;border-top:1px dashed var(--border)">'
-      + '<div class="section-title" style="margin-bottom:6px">Non-billable models (informational)</div>'
-      + '<div style="font-size:11px;color:var(--muted);margin-bottom:8px">'
-      + 'GitHub Copilot does <strong>not</strong> bill these models — they appear here only so you can see local Ollama, LM Studio, BYOK, or unrecognised model traffic. '
-      + 'Credit numbers below are <em>rate-table estimates</em> of what the equivalent Copilot traffic would cost, and are <strong>excluded from the billed total above</strong>. '
-      + 'Toggle <code>copilotUsage.aic.includeOnlyBilledModels</code> off to restore legacy behaviour.'
+  if (nb) {
+    // Re-aggregate from the per-day rows so this panel honours the selected
+    // range like every table above it. nb.byModel is whole-cycle and is only
+    // used as a fallback for payloads that predate nb.byDay.
+    const nbAgg = {};
+    let nbTotal = 0;
+    if (nb.byDay && nb.byDay.length) {
+      nb.byDay
+        .filter(d => (!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end))
+        .forEach(d => {
+          const row = nbAgg[d.model] || (nbAgg[d.model] = {model:d.model,tier:d.tier,inputCredits:0,outputCredits:0,cachedCredits:0,totalCredits:0});
+          row.inputCredits += d.inputCredits;
+          row.outputCredits += d.outputCredits;
+          row.cachedCredits += d.cachedCredits;
+          row.totalCredits += d.totalCredits;
+          nbTotal += d.totalCredits;
+        });
+    } else if (useOriginalByModel) {
+      (nb.byModel||[]).forEach(m => { nbAgg[m.model] = m; });
+      nbTotal = nb.totalCredits;
+    }
+    // Drop zero-credit rows — token-less requests (e.g. a cancelled turn on an
+    // unrecognised model) otherwise render as pure "0.00" noise.
+    const nbVisible = Object.values(nbAgg)
+      .filter(m => m.totalCredits >= 0.005)
+      .sort((a, b) => b.totalCredits - a.totalCredits);
+    if (nbVisible.length > 0) {
+      let nbRows = '';
+      nbVisible.forEach(m => {
+        const tierBadge = m.tier === 'premium'
+          ? '<span class="mult-badge mult-high">premium</span>'
+          : m.tier === 'base'
+            ? '<span class="mult-badge mult-1">base</span>'
+            : '<span class="mult-badge">custom</span>';
+        nbRows += '<tr><td><span class="model-tag '+mc(m.model)+'">'+esc(m.model)+'</span> '+tierBadge+'</td>'
+          + '<td class="num">'+m.inputCredits.toFixed(2)+'</td>'
+          + '<td class="num">'+m.outputCredits.toFixed(2)+'</td>'
+          + '<td class="num cached">'+m.cachedCredits.toFixed(2)+'</td>'
+          + '<td class="num" style="color:var(--muted)">'+m.totalCredits.toFixed(2)+'</td></tr>';
+      });
+      nonBillableHTML = '<div style="margin-top:16px;padding-top:12px;border-top:1px dashed var(--border)">'
+        + '<div class="section-title" style="margin-bottom:6px">Non-billable models (informational)</div>'
+        + '<div style="font-size:11px;color:var(--muted);margin-bottom:8px">'
+        + 'GitHub Copilot does <strong>not</strong> bill these models — they appear here only so you can see local Ollama, LM Studio, BYOK, or unrecognised model traffic, and they are <strong>excluded from the billed total above</strong>. '
+        + 'Numbers are AI credits, not tokens (1 credit = $0.01). For agent sessions the total is the <em>cost billed by the provider itself</em>; where no provider cost is recorded it is a Copilot rate-table estimate. The input/output/cached split is apportioned from token counts. '
+        + 'Toggle <code>copilotUsage.aic.includeOnlyBilledModels</code> off to restore legacy behaviour.'
+        + '</div>'
+        + '<table><thead><tr><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cached</th><th class="num">Total (credits)</th></tr></thead><tbody>'
+        + nbRows
+        + '</tbody><tfoot><tr><td colspan="4" style="text-align:right;color:var(--muted)">Non-billable total (informational):</td><td class="num" style="color:var(--muted)"><strong>'+nbTotal.toFixed(2)+'</strong></td></tr></tfoot></table>'
+        + '</div>';
+    }
+  }
+
+  // ── Systems (cross-machine rollups shared over Settings Sync) ──────────
+  // Rendered only when a second machine has reported, since a one-row table
+  // just repeats the headline numbers. The headline tiles above stay strictly
+  // machine-local so they remain reconcilable against a single local source.
+  let systemsHTML = '';
+  const machines = (DATA.machines || []).filter(m => m && m.host);
+  if (machines.length > 1) {
+    const ago = ts => {
+      const mins = Math.max(0, Math.round((Date.now() - ts) / 60000));
+      if (mins < 60) return mins + 'm ago';
+      const hrs = Math.round(mins / 60);
+      if (hrs < 48) return hrs + 'h ago';
+      return Math.round(hrs / 24) + 'd ago';
+    };
+    let combined = 0;
+    const rate = (aic.config && aic.config.overageCostPerCredit) || 0.01;
+    const usd = c => '$' + (c * rate).toFixed(2);
+    const sysRows = machines.map(m => {
+      const sameCycle = m.cycleStart === aic.billingCycleStart;
+      if (sameCycle) combined += (m.cycleCredits || 0);
+      const tag = m.isThisMachine
+        ? ' <span style="color:#4ec9b0;font-size:10px">(this system)</span>'
+        : '';
+      const stale = m.dormant
+        ? ' <span style="color:#e5c07b;font-size:10px" title="No update in over 7 days — its figures may be out of date">dormant</span>'
+        : '';
+      const cyc = sameCycle
+        ? ''
+        : ' <span style="color:#e5c07b;font-size:10px" title="Reported against a different billing cycle, so it is excluded from the combined total">other cycle</span>';
+      return '<tr><td><strong>'+esc(m.label)+'</strong>'+tag+'</td>'
+        + '<td>'+esc(m.host)+' <span style="color:var(--muted);font-size:10px">'+esc(m.platform)+'</span></td>'
+        + '<td class="num">'+(+(m.cycleCredits||0)).toFixed(2)+cyc+'</td>'
+        + '<td class="num" style="color:var(--muted)">'+usd(m.cycleCredits||0)+'</td>'
+        + '<td class="num">'+(m.sessions||0)+'</td>'
+        + '<td class="num">'+(m.turns||0)+'</td>'
+        + '<td class="num">'+(m.totalTokens||0).toLocaleString()+'</td>'
+        + '<td>'+ago(m.lastSeen)+stale+'</td></tr>';
+    }).join('');
+
+    // The budget is an account allowance, not a per-machine one, so overage is
+    // only meaningful against the combined figure — the per-system dollar
+    // amounts above are gross value at the same rate, not separate bills.
+    const effBudget = isPromo ? promo.promoBudget : (aic.monthlyBudget || 0);
+    const overCombined = effBudget > 0 ? Math.max(0, combined - effBudget) : 0;
+    const overageRow = effBudget > 0
+      ? '<tr><td colspan="3" style="text-align:right;color:var(--muted)">'
+        + 'Combined overage vs '+effBudget.toLocaleString()+'-credit allowance'+(isPromo ? ' (promo)' : '')+':</td>'
+        + '<td class="num"><strong style="color:'+(overCombined > 0 ? 'var(--orange)' : 'var(--green)')+'">'
+        + '$'+(overCombined * rate).toFixed(2)+'</strong></td><td colspan="4"></td></tr>'
+      : '';
+
+    systemsHTML = '<div style="margin-top:16px">'
+      + '<div class="section-title" style="margin-bottom:8px">Systems — Combined Usage</div>'
+      + '<div style="padding:8px 10px;background:var(--border);border-radius:4px;font-size:10px;color:var(--muted);margin-bottom:8px">'
+      + 'Each system publishes a rollup of its own credits over Settings Sync. Logs, prompts and session contents are never shared. '
+      + 'The headline tiles above remain this-system-only, so they stay reconcilable against local data; the combined figure is shown here. '
+      + 'Per-system cost is credits &times; $'+rate+' &mdash; gross value, not a separate bill. Only the combined overage below is chargeable.'
       + '</div>'
-      + '<table><thead><tr><th>Model</th><th class="num">Input (est)</th><th class="num">Output (est)</th><th class="num">Cached (est)</th><th class="num">Total (est)</th></tr></thead><tbody>'
-      + nbRows
-      + '</tbody><tfoot><tr><td colspan="4" style="text-align:right;color:var(--muted)">Non-billable total (informational):</td><td class="num" style="color:var(--muted)"><strong>'+nb.totalCredits.toFixed(2)+'</strong></td></tr></tfoot></table>'
+      + '<table><thead><tr><th>System</th><th>Host</th><th class="num">Credits (cycle)</th><th class="num">Cost</th><th class="num">Sessions</th><th class="num">Turns</th><th class="num">Tokens</th><th>Last seen</th></tr></thead><tbody>'
+      + sysRows
+      + '</tbody><tfoot><tr><td colspan="2" style="text-align:right;color:var(--muted)">Combined this cycle:</td>'
+      + '<td class="num"><strong>'+combined.toFixed(2)+'</strong></td>'
+      + '<td class="num"><strong>'+usd(combined)+'</strong></td><td colspan="4"></td></tr>'
+      + overageRow
+      + '</tfoot></table>'
       + '</div>';
   }
 
@@ -1115,6 +1210,7 @@ function renderAIC(aic, bounds, filteredSessions) {
     + '<div>'+calendarHTML+'</div>'
     + '</div>'
     + nonBillableHTML
+    + systemsHTML
     + '</div>';
 }
 

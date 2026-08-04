@@ -886,5 +886,126 @@ chain read:
   <li><strong>Open question:</strong> Visual acceptance still requires testing inside VS Code because TypeScript and lint checks cannot verify native hover geometry.</li>
 </ul>
 
+<h2>Non-billable panel &mdash; date-range correctness (1.10.74)</h2>
+<p>
+Follow-up on the issue #5 panel. The billable side of the AIC card is range-aware
+(<code>renderAIC</code> filters <code>aic.byDay</code> by <code>bounds</code>, and falls back to session
+aggregation for historical ranges), but the informational panel rendered
+<code>aic.nonBillable.byModel</code> verbatim &mdash; a whole-billing-cycle aggregate. Any range other than
+the full cycle showed two tables describing two different windows.
+</p>
+<ul>
+  <li><strong>Design decision:</strong> Carry a <code>nonBillable.byDay</code> map
+      (<code>day &rarr; model &rarr; CreditUsage</code>) out of <code>computeSummary</code> rather than
+      re-deriving non-billable rows in the webview. It is filled in the same loop as
+      <code>nonBillable.byModel</code>, so the two reconcile exactly by construction &mdash; there is no
+      second classification path that can drift.</li>
+  <li><strong>Deviation:</strong> The billable side exposes <code>byDay</code> as day&rarr;total only;
+      the non-billable side needs per-model detail inside each day because the panel is a model table,
+      not a calendar. The shapes are intentionally asymmetric.</li>
+  <li><strong>Tradeoff:</strong> Considered reusing <code>filteredSessions</code> (how the billable model
+      table handles historical ranges) instead of a new field. Rejected: session rows carry only a single
+      billable <code>aicCredits</code> figure with no billable/non-billable split, so it cannot reconstruct
+      this panel. <code>byModel</code> is still read as a fallback for cached payloads that predate
+      <code>byDay</code>.</li>
+  <li><strong>Deviation:</strong> Rows under <code>0.005</code> credits are dropped from display only.
+      They stay in the data so totals and future reconciliation are unaffected. This is what removed the
+      confusing <code>claude-opus-5 &mdash; base &mdash; 0.00</code> row that sat beneath a
+      <code>claude-opus-5 &mdash; premium &mdash; 1394.53</code> row in the billed table: a token-less turn
+      on a model absent from the local rate table falls through to the default <code>base</code> tier.</li>
+  <li><strong>Open question:</strong> For ranges that predate the current billing cycle the panel is
+      necessarily empty &mdash; <code>computeSummary</code> drops out-of-cycle entries before classifying
+      them, so no non-billable history exists to show. Confirm whether an explicit "no non-billable usage
+      in this range" placeholder is preferable to hiding the panel entirely.</li>
+</ul>
+
+<h2>Model resolution &mdash; family fallback (1.10.74)</h2>
+<p>
+The <code>claude-opus-5 &mdash; base &mdash; 0.00</code> row was not display noise; it was the visible
+symptom of a resolution failure. <code>claude-opus-5</code> was absent from
+<code>DEFAULT_MODEL_COSTS</code>, so with the live CAPI catalog unavailable <code>findModelRate()</code>
+returned <code>null</code> and three things broke at once:
+</p>
+<table>
+  <tr><th>Consumer of <code>findModelRate()</code></th><th>Behaviour when it returns <code>null</code></th></tr>
+  <tr><td><code>calculateCredits()</code></td><td>Applies the gpt-4.1 default: 200/800 per 1M instead of 500/2500.</td></tr>
+  <tr><td>tier badge</td><td>Defaults to <code>base</code>; the billed table's <code>premium</code> badge comes from an unrelated <code>?? "premium"</code> in the actual-credits branch, which is why the same model rendered with two different tiers.</td></tr>
+  <tr><td><code>isKnownGHCModel()</code> &rarr; <code>classifyModelBillability()</code> step 5</td><td>Returns <code>false</code>, so any request without <code>copilotUsageNanoAiu</code> lands in the non-billable panel.</td></tr>
+</table>
+<ul>
+  <li><strong>Design decision:</strong> The dynamic map (<code>modelCatalog.ts</code>) is still the primary
+      resolver and runs first in <code>findModelRate()</code>. What was missing is a <em>degradation path</em>
+      for the windows where it cannot answer: the kill switch is off, the 24h cache is stale, the CAPI
+      refresh failed, or the model is newer than the last successful fetch. A static list is by definition
+      always one release behind, so the fallback is now structural rather than a list edit.</li>
+  <li><strong>Design decision:</strong> Fall back by <em>family</em>, not by nearest-string. An unmatched id
+      is split into family + version tail + optional variant, and inherits the newest table entry sharing
+      that family and variant &mdash; <code>gpt-5.7-codex</code> takes <code>gpt-5.3-codex</code>, not
+      <code>gpt-5.5</code>. Rates and tier are borrowed; the observed id is kept for display so the table
+      never claims the user ran a model they did not.</li>
+  <li><strong>Tradeoff:</strong> A bare-integer version tail is only accepted when the family has two or
+      more segments. <code>claude-opus-6</code> resolves; <code>gpt-6</code> does not. This is deliberate:
+      the provider guard depends on <code>gpt-4</code> / <code>gpt-5</code> / <code>claude</code> staying
+      unresolved, because those are exactly the ids a local Ollama or BYOK provider registers. Losing a
+      hypothetical new major is the cheaper error &mdash; the live catalog covers it, and a wrong
+      <em>billable</em> verdict on local traffic is the bug this whole panel exists to prevent.</li>
+  <li><strong>Deviation:</strong> Considered making <code>isKnownGHCModel()</code> consult
+      <code>classifyByCatalog()</code> so a CAPI entry with no <code>token_prices</code> block still counts
+      as known. Rejected for now: it splits "is it billable" from "what does it cost" across two sources
+      and would let a model be billable with no defensible rate. The family fallback answers both at once.</li>
+  <li><strong>Open question:</strong> <code>grok-4.5</code>'s rates were read off the VS Code Language Models
+      view (In 200 / Out 600, cache write 0); its cache-read price was truncated in that view and is
+      assumed to follow the 10%-of-input pattern every other entry uses, and its premium tier is inferred
+      rather than observed. Worth confirming against a live CAPI response &mdash; though the catalog
+      overrides the static entry whenever it loads.</li>
+</ul>
+
+<h2>Catalog refresh &mdash; miss-driven instead of TTL-driven (1.10.75)</h2>
+
+<p>Prompted by the question "why don't we just cache once and update only when something changed?" The
+answer is that we already cache correctly &mdash; the gap was <em>when</em> we decide something changed.</p>
+
+<p>What the catalog already did, and still does: persists in <code>globalState</code> under
+<code>copilotUsage.aic.modelCatalog.v1</code>; hydrates synchronously at activation before any network
+call; survives restarts and extension upgrades; serves the stale snapshot while a refresh runs; and
+discards a refresh that produced zero entries rather than overwriting a good snapshot. It is a
+write-on-success store, not a per-session fetch.</p>
+
+<p>What was wrong: <code>CATALOG_TTL_MS</code> gated refreshes purely on <em>age</em>. A snapshot taken at
+09:00 is "fresh" for the rest of the day, so a model GitHub enables at 14:00 is invisible until tomorrow.
+The cache is a snapshot of a set that grows without notice, so age is simply the wrong signal.</p>
+
+<ul>
+  <li><strong>Design decision:</strong> The <em>right</em> signal is a resolution miss. If neither the live
+      snapshot nor the static rate table can resolve an observed id, that is direct evidence the snapshot
+      predates a shipped model. <code>notifyUnknownModel()</code> is called from
+      <code>findModelRate()</code> at the point it falls through to the family fallback, and forces a
+      refresh out of band.</li>
+  <li><strong>Design decision:</strong> Placed the call at the family-fallback boundary rather than right
+      after the <code>getRatesFor()</code> miss. The earlier position would fire for every model the static
+      table already prices correctly, which is noise; the later position fires only for ids nothing knows.</li>
+  <li><strong>Design decision:</strong> <code>refreshCtx</code> is captured inside <code>loadCatalog()</code>
+      rather than threading an <code>ExtensionContext</code> down through <code>AICCalculator</code>.
+      <code>findModelRate()</code> is called per credit entry from several call sites; giving all of them a
+      context purely to enable a refresh would be a large change for a side effect.</li>
+  <li><strong>Tradeoff:</strong> Three independent debounces, because <code>findModelRate()</code> runs
+      thousands of times per scan: one report per id per session, one refresh in flight at a time
+      (<code>runRefresh()</code>, which now also guards the activation path that previously could overlap),
+      and a hard floor of 15 minutes on snapshot age. The age floor does double duty &mdash; it is also what
+      stops local and BYOK ids from retriggering fetches. Those are never in CAPI, so no refresh will ever
+      resolve them, and without the floor every new Ollama model would cost a round trip.</li>
+  <li><strong>Tradeoff:</strong> A brand-new model is still mispriced for up to 15 minutes plus the refresh
+      latency. Accepted: the family fallback covers that window with a sibling's rate and, critically, the
+      correct <em>billable</em> verdict, so the visible error is a rate approximation rather than spend
+      disappearing from the billed table.</li>
+  <li><strong>Deviation:</strong> A miss with no snapshot at all (cold start, offline, failed token mint)
+      deliberately does nothing &mdash; <code>loadCatalog()</code> already has a refresh in flight in that
+      state, and firing a second one would just race it.</li>
+  <li><strong>Open question:</strong> The 15-minute floor is a guess, not a measurement. If GitHub's model
+      set turns out to churn faster than that in practice it should come down; if BYOK-heavy users report
+      refresh chatter it should go up. Worth revisiting once there is telemetry on how often
+      <code>notifyUnknownModel()</code> actually fires.</li>
+</ul>
+
 </body>
 </html>

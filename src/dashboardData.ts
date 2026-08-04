@@ -9,6 +9,7 @@ import { CliScanResult } from "./cliScanner";
 import { LiveStats, OTelRequest } from "./otelReceiver";
 import { AICCalculator, AICConfig, DEFAULT_AIC_CONFIG, createCalculatorFromConfig, getPromoInfo, classifyModelBillability } from "./aicCredits";
 import { classifyByCatalog, getCachedCatalog } from "./modelCatalog";
+import { MachineView } from "./machineSync";
 import { computeCacheHit } from "./cache";
 
 /**
@@ -241,6 +242,14 @@ export interface DashboardData {
    * hardcoded fallback multiplier table.
    */
   modelMultipliers: Record<string, number>;
+  /**
+   * Per-machine usage rollups shared over Settings Sync. Populated by the
+   * caller (which owns the ExtensionContext); empty when sync is off or only
+   * this machine has reported.
+   */
+  machines?: MachineView[];
+  /** Σ `machines[].cycleCredits` for the current cycle. */
+  combinedCycleCredits?: number;
 }
 
 /** Per-source usage breakdown: VS Code chatSessions, Oh My Pi agent, Pi coding agent */
@@ -339,6 +348,20 @@ export interface AICDashboardData {
   nonBillable: {
     totalCredits: number;
     byModel: Array<{
+      model: string;
+      tier: string;
+      inputCredits: number;
+      outputCredits: number;
+      cachedCredits: number;
+      totalCredits: number;
+    }>;
+    /**
+     * Per-day, per-model rows. The webview re-aggregates these for the
+     * selected date range so the informational panel tracks the same window
+     * as the billable tables above (`byModel` stays whole-cycle).
+     */
+    byDay: Array<{
+      day: string;
       model: string;
       tier: string;
       inputCredits: number;
@@ -1340,24 +1363,37 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
       //
       // Prefer the agent's own usage.cost.total ledger when present. OMP/Pi
       // store that field in USD, and agentScanner converts it to AIC credits.
-      // Older/cost-less sessions fall back to the token-rate calculator.
+      // Copilot-routed sessions without that field fall back to the token-rate
+      // calculator; third-party sessions never do (see below).
       for (const [model, stats] of Object.entries(session.modelBreakdown)) {
-        const grossInput = stats.input + stats.cacheRead + stats.cacheWrite;
-        const usage = calculator.calculateCredits(model, grossInput, stats.output, stats.cacheRead, stats.cacheWrite);
-        const actualCredits = stats.costCredits > 0 ? stats.costCredits : usage.totalCredits;
         const provider = (stats.provider || session.provider || "").toLowerCase();
         const providerIsCopilot = provider.includes("github") || provider.includes("copilot");
         const providerIsThirdParty = provider.length > 0 && !providerIsCopilot;
         const billable = providerIsThirdParty ? false : classify(model, false, provider || undefined);
+        // GitHub's rate card prices GitHub-routed traffic only. For a third-party
+        // provider the agent's own cost ledger is the sole valid source — pricing
+        // its tokens with Copilot rates invents spend that never happened (e.g.
+        // Azure-hosted Kimi reports no cost, yet billed ~95 credits here).
+        let actualCredits: number;
+        if (providerIsThirdParty) {
+          actualCredits = stats.costCredits;
+        } else {
+          const grossInput = stats.input + stats.cacheRead + stats.cacheWrite;
+          actualCredits = stats.costCredits > 0
+            ? stats.costCredits
+            : calculator.calculateCredits(model, grossInput, stats.output, stats.cacheRead, stats.cacheWrite).totalCredits;
+        }
         if (actualCredits <= 0) {
           continue;
         }
         const displayModel = providerIsThirdParty ? `${provider}/${model}` : model;
+        // Tokens are carried so computeSummary can split the ledger total across
+        // input/output/cached; the total itself always comes from actualCredits.
         creditEntries.push({
           model: displayModel,
-          inputTokens: 0,
-          outputTokens: 0,
-          cachedTokens: 0,
+          inputTokens: stats.input,
+          outputTokens: stats.output,
+          cachedTokens: stats.cacheRead,
           date,
           actualCredits,
           billable,
@@ -1511,6 +1547,17 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         cachedCredits: Math.round(m.cachedCredits * 100) / 100,
         totalCredits: Math.round(m.totalCredits * 100) / 100,
       })).sort((a, b) => b.totalCredits - a.totalCredits),
+      byDay: Array.from(summary.nonBillable.byDay.entries()).flatMap(([day, models]) =>
+        Array.from(models.values()).map(m => ({
+          day,
+          model: m.model,
+          tier: m.tier,
+          inputCredits: Math.round(m.inputCredits * 100) / 100,
+          outputCredits: Math.round(m.outputCredits * 100) / 100,
+          cachedCredits: Math.round(m.cachedCredits * 100) / 100,
+          totalCredits: Math.round(m.totalCredits * 100) / 100,
+        })),
+      ).sort((a, b) => a.day.localeCompare(b.day)),
     },
     promo: {
       isPromoActive: promoInfo.isPromoActive,

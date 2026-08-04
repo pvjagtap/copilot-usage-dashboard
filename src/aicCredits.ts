@@ -16,10 +16,13 @@
  * Rate resolution order (findModelRate):
  *   1. Live CAPI catalog via `getRatesFor()` — authoritative when available.
  *   2. Static `DEFAULT_MODEL_COSTS` / user-supplied `customModelCosts` —
- *      offline fallback.
+ *      offline fallback (exact, then substring).
+ *   3. Family fallback — newest rate in the same model family, so a point
+ *      release GitHub ships between extension updates is still priced and
+ *      still classified as Copilot-billable.
  */
 
-import { getRatesFor } from "./modelCatalog";
+import { getRatesFor, notifyUnknownModel } from "./modelCatalog";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -110,6 +113,8 @@ export interface CreditSummary {
   nonBillable: {
     totalCredits: number;
     byModel: Map<string, CreditUsage>;
+    /** day → model → usage. Lets consumers re-aggregate for a selected date range. */
+    byDay: Map<string, Map<string, CreditUsage>>;
   };
   /** Plan budget info */
   plan: PlanConfig;
@@ -142,6 +147,7 @@ export interface CreditSummary {
 export const DEFAULT_MODEL_COSTS: ModelCostRate[] = [
   // ── Anthropic (includes cache write cost) ──
   // Source: https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing#anthropic
+  { model: "claude-opus-5",       inputCreditsPerMillion: 500, outputCreditsPerMillion: 2500, cachedInputCreditsPerMillion: 50, cacheWriteCreditsPerMillion: 625, tier: "premium" },
   { model: "claude-opus-4.8",     inputCreditsPerMillion: 500, outputCreditsPerMillion: 2500, cachedInputCreditsPerMillion: 50, cacheWriteCreditsPerMillion: 625, tier: "premium" },
   { model: "claude-opus-4.7",     inputCreditsPerMillion: 500, outputCreditsPerMillion: 2500, cachedInputCreditsPerMillion: 50, cacheWriteCreditsPerMillion: 625, tier: "premium" },
   { model: "claude-opus-4.6",     inputCreditsPerMillion: 500, outputCreditsPerMillion: 2500, cachedInputCreditsPerMillion: 50, cacheWriteCreditsPerMillion: 625, tier: "premium" },
@@ -179,6 +185,9 @@ export const DEFAULT_MODEL_COSTS: ModelCostRate[] = [
 
   // ── Microsoft ──
   { model: "mai-code-1-flash",    inputCreditsPerMillion: 75,  outputCreditsPerMillion: 450,  cachedInputCreditsPerMillion: 7,    cacheWriteCreditsPerMillion: 0, tier: "base" },
+
+  // ── xAI ──
+  { model: "grok-4.5",            inputCreditsPerMillion: 200, outputCreditsPerMillion: 600,  cachedInputCreditsPerMillion: 20,   cacheWriteCreditsPerMillion: 0, tier: "base" },
 
   // ── Fine-tuned (GitHub) ──
   { model: "raptor-mini",         inputCreditsPerMillion: 25,  outputCreditsPerMillion: 200,  cachedInputCreditsPerMillion: 2.5,  cacheWriteCreditsPerMillion: 0, tier: "base" },
@@ -378,6 +387,9 @@ export class AICCalculator {
   * observed id must not match a longer rate-table id. Otherwise local/BYOK
   * aliases like "gpt-4" or "claude" are incorrectly treated as GitHub
   * Copilot-billable models.
+  *
+  * Unmatched ids get one last chance via `_findFamilyRate()` before we give
+  * up and treat the model as unknown.
    */
   findModelRate(modelName: string): ModelCostRate | null {
     // 1) Live CAPI catalog — authoritative and self-updating.
@@ -408,8 +420,69 @@ export class AICCalculator {
         bestLen = key.length;
       }
     }
+    if (bestMatch) {
+      return bestMatch;
+    }
 
-    return bestMatch;
+    // Reaching here means the snapshot may predate this model — let the
+    // catalog decide whether that warrants an out-of-band refresh.
+    notifyUnknownModel(modelName);
+
+    // 3) Family fallback — price an unseen point release from its family.
+    return this._findFamilyRate(normalized);
+  }
+
+  /**
+   * Resolve a model the rate table has never seen by borrowing the newest
+   * rate from its own family: `claude-opus-6` → `claude-opus-4.8`,
+   * `gpt-5.7-codex` → `gpt-5.3-codex`, `gemini-4.0-flash` → `gemini-3.6-flash`.
+   *
+   * Without this, every model GitHub ships between extension releases (and
+   * every model the live CAPI catalog fails to return) falls through to the
+   * "unknown model" path in `calculateCredits()`: gpt-4.1 rates, a wrong
+   * `base` tier, and — worst — `isKnownGHCModel() === false`, which dumps a
+   * genuinely Copilot-billed model into the non-billable panel.
+   *
+   * The version tail may only be a bare integer when the family has two or
+   * more segments. That keeps short BYOK aliases such as `gpt-4` / `gpt-5` /
+   * `claude` unresolved, which the provider guard depends on
+   * (tests/verify-rate-match-provider-guard.js). A brand-new major like
+   * `gpt-6` therefore still needs the live catalog or a table entry.
+   */
+  private _findFamilyRate(normalized: string): ModelCostRate | null {
+    // "5.6-sol" → version "5.6", variant "sol"; "4.8" → version "4.8", variant "".
+    const VERSION_TAIL = /^(\d[\d.]*)(?:-(.+))?$/;
+    const segs = normalized.split("-");
+
+    for (let i = segs.length - 1; i >= 1; i--) {
+      const tail = VERSION_TAIL.exec(segs.slice(i).join("-"));
+      if (!tail || (i < 2 && !tail[1].includes("."))) {
+        continue;
+      }
+      const variant = tail[2] ?? "";
+      const prefix = segs.slice(0, i).join("-") + "-";
+
+      let best: ModelCostRate | null = null;
+      let bestVersion = -1;
+      for (const [key, rate] of this.modelCosts) {
+        if (!key.startsWith(prefix)) {
+          continue;
+        }
+        const cand = VERSION_TAIL.exec(key.slice(prefix.length));
+        if (!cand || (cand[2] ?? "") !== variant) {
+          continue;
+        }
+        const version = parseFloat(cand[1]);
+        if (version > bestVersion) {
+          bestVersion = version;
+          best = rate;
+        }
+      }
+      if (best) {
+        return { ...best, model: normalized };
+      }
+    }
+    return null;
   }
 
   /**
@@ -516,7 +589,20 @@ export class AICCalculator {
     // Non-billable bucket (informational only — never sums into headline totals
     // or budget math).
     const nonBillableByModel = new Map<string, CreditUsage>();
+    const nonBillableByDay = new Map<string, Map<string, CreditUsage>>();
     let nonBillableTotal = 0;
+
+    const accumulate = (map: Map<string, CreditUsage>, usage: CreditUsage): void => {
+      const existing = map.get(usage.model);
+      if (existing) {
+        existing.inputCredits += usage.inputCredits;
+        existing.outputCredits += usage.outputCredits;
+        existing.cachedCredits += usage.cachedCredits;
+        existing.totalCredits += usage.totalCredits;
+      } else {
+        map.set(usage.model, { ...usage });
+      }
+    };
 
     for (const entry of entries) {
       // Cycle-window filter. Empty/"unknown" dates are kept (callers like the
@@ -592,15 +678,13 @@ export class AICCalculator {
 
       if (!isBillable) {
         nonBillableTotal += usage.totalCredits;
-        const existing = nonBillableByModel.get(usage.model);
-        if (existing) {
-          existing.inputCredits += usage.inputCredits;
-          existing.outputCredits += usage.outputCredits;
-          existing.cachedCredits += usage.cachedCredits;
-          existing.totalCredits += usage.totalCredits;
-        } else {
-          nonBillableByModel.set(usage.model, { ...usage });
+        accumulate(nonBillableByModel, usage);
+        let dayBucket = nonBillableByDay.get(day);
+        if (!dayBucket) {
+          dayBucket = new Map<string, CreditUsage>();
+          nonBillableByDay.set(day, dayBucket);
         }
+        accumulate(dayBucket, usage);
         continue;
       }
 
@@ -645,6 +729,7 @@ export class AICCalculator {
       nonBillable: {
         totalCredits: nonBillableTotal,
         byModel: nonBillableByModel,
+        byDay: nonBillableByDay,
       },
       plan: this.plan,
       creditsRemaining,

@@ -20,6 +20,7 @@ import { Enforcement } from "./enforcement";
 import { HookManager } from "./hookManager";
 import { detectAndApplyPlan, resetPlanDetection } from "./planDetector";
 import { loadCatalog as loadModelCatalog } from "./modelCatalog";
+import { registerSyncKeys, publishAndRead, combinedCredits } from "./machineSync";
 import { computeCacheHit } from "./cache";
 
 const OTEL_PORT = 14318;
@@ -65,6 +66,7 @@ let debugLogScanInFlight = false;
 let activationTime: string;
 /** Cached dashboard data — invalidated when scan or OTel changes */
 let cachedDashData: DashboardData | undefined;
+let extCtx: vscode.ExtensionContext | undefined;
 let lastOtelRequests = 0;
 let otelDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -126,6 +128,32 @@ function buildData(): DashboardData {
   };
   const aicConfig = getAICConfig();
   cachedDashData = buildDashboardData(scan, otelStats, aicConfig, lastAgentScan, activationTime, lastCliScan);
+
+  // Publish this machine's rollup and fold in whatever other systems have
+  // synced. Rollups only — never raw sessions, prompts or log contents.
+  if (extCtx) {
+    const aic = cachedDashData.aicSummary;
+    const byDay: Record<string, number> = {};
+    for (const d of aic.byDay) { byDay[d.day] = d.credits; }
+    const byModel: Record<string, number> = {};
+    for (const m of aic.byModel) { byModel[m.model] = m.totalCredits; }
+    try {
+      const machines = publishAndRead(extCtx, {
+        cycleStart: aic.billingCycleStart,
+        cycleCredits: aic.totalCredits,
+        sessions: cachedDashData.agentSummary.totalSessions,
+        turns: scan.turns.length,
+        totalTokens: cachedDashData.agentSummary.vscodeTotalTokens,
+        byDay,
+        byModel,
+      });
+      cachedDashData.machines = machines;
+      cachedDashData.combinedCycleCredits = combinedCredits(machines, aic.billingCycleStart);
+    } catch (err) {
+      output.appendLine(`machineSync: publish failed — ${String(err)}`);
+    }
+  }
+
   const elapsed = Date.now() - t0;
   if (elapsed > 200) {
     output.appendLine(
@@ -179,6 +207,8 @@ async function runScan(): Promise<void> {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  extCtx = context;
+  registerSyncKeys(context);
   output = vscode.window.createOutputChannel("Copilot Usage");
   context.subscriptions.push(output);
 

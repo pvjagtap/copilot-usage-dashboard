@@ -52,7 +52,11 @@
  *   • `loadCatalog()` is called once at extension activation.
  *   • The returned set/map is exposed via `getCachedCatalog()` so the
  *     classifier can consult it synchronously on every credit entry.
- *   • A refresh runs once per 24 hours (or on demand).
+ *   • A refresh runs once per 24 hours (or on demand), and immediately when
+ *     `notifyUnknownModel()` reports an id the snapshot cannot resolve —
+ *     a miss is the only direct evidence that the snapshot predates a
+ *     newly-shipped model, and waiting out the TTL would mispriced it for
+ *     up to a day.
  */
 
 import * as vscode from "vscode";
@@ -94,8 +98,27 @@ const SCOPE_CANDIDATES: string[][] = [
 /** How long a successful catalog is considered fresh. */
 const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** globalState key for the cached catalog. */
+/** A cache miss only forces a refresh once the snapshot is at least this old. */
+const MISS_REFRESH_MIN_AGE_MS = 15 * 60 * 1000;
+
+/** globalState key for the machine-local part of the catalog. */
 const CATALOG_CACHE_KEY = "copilotUsage.aic.modelCatalog.v1";
+
+/**
+ * globalState key for the account-scoped part of the catalog (CAPI rates +
+ * CDN provider lists), declared to Settings Sync so every machine signed into
+ * the same account converges on one snapshot.
+ *
+ * Deliberately excludes `userVendorByModelId`: that map is built from this
+ * machine's `chatLanguageModels.json` and its live `vscode.lm` registry, so
+ * syncing it would tag a model as third-party on a machine where no such
+ * provider exists — which feeds `classify()` and flips rows between billable
+ * and non-billable.
+ *
+ * Declared to Settings Sync by `machineSync.registerSyncKeys()`, which owns
+ * the single `setKeysForSync` call.
+ */
+export const CATALOG_SYNC_KEY = "copilotUsage.aic.modelCatalogRates.v1";
 
 /** Default User-Agent — matches what `planDetector.ts` sends. */
 const USER_AGENT = "vscode-copilot-usage-dashboard";
@@ -218,12 +241,20 @@ export interface ModelCatalog {
   userVendorByModelId: Map<string, string>;
 }
 
-interface CatalogCachePayload {
+/** The account-scoped subset written to `CATALOG_SYNC_KEY`. */
+interface SyncedCatalogPayload {
   fetchedAt: number;
   entries: ModelCatalogEntry[];
   cdnProviders: Record<string, string[]>;
+}
+
+interface CatalogCachePayload {
+  fetchedAt: number;
   /** Persisted form of `ModelCatalog.userVendorByModelId`. */
   userVendorByModelId?: Array<[string, string]>;
+  /** Pre-split payloads carried the rates here too; read for migration only. */
+  entries?: ModelCatalogEntry[];
+  cdnProviders?: Record<string, string[]>;
 }
 
 type LogFn = (msg: string) => void;
@@ -231,6 +262,14 @@ type LogFn = (msg: string) => void;
 // ─── Module state ─────────────────────────────────────────────
 
 let cached: ModelCatalog | null = null;
+
+/** Captured by `loadCatalog()` so a cache miss can refresh without plumbing. */
+let refreshCtx: { ctx: vscode.ExtensionContext; log: LogFn } | null = null;
+
+/** Unknown ids seen this session — each may force at most one refresh. */
+const notifiedUnknownIds = new Set<string>();
+
+let refreshInFlight = false;
 
 // ─── Public API ───────────────────────────────────────────────
 
@@ -334,6 +373,27 @@ export function __setCatalogForTesting(snapshot: ModelCatalog | null): void {
 }
 
 /**
+ * Report a model id that neither the live catalog nor the static rate table
+ * could resolve, forcing a refresh rather than waiting out the 24h TTL.
+ *
+ * Debounced three ways: each id reports once per session, only one refresh
+ * runs at a time, and a snapshot younger than `MISS_REFRESH_MIN_AGE_MS` is
+ * trusted as-is — which is also what stops local/BYOK ids (never present in
+ * CAPI, so permanently unresolvable) from causing repeated fetches.
+ */
+export function notifyUnknownModel(modelId: string): void {
+  if (!refreshCtx || !modelId) return;
+  const key = modelId.toLowerCase();
+  if (notifiedUnknownIds.has(key)) return;
+  notifiedUnknownIds.add(key);
+  // Cold start has no snapshot to invalidate — `loadCatalog()` already refreshes.
+  if (!cached) return;
+  if (Date.now() - cached.fetchedAt < MISS_REFRESH_MIN_AGE_MS) return;
+  refreshCtx.log(`modelCatalog: unresolved model "${key}" — forcing refresh`);
+  runRefresh(refreshCtx.ctx, refreshCtx.log);
+}
+
+/**
  * Lookup helper used by the classifier. Returns `null` when the model is
  * not present in the catalog — callers should fall through to the existing
  * rate-table heuristic in that case.
@@ -416,22 +476,38 @@ export function loadCatalog(
   // Honour the user-facing kill switch — `useOnlineModelCatalog === false`.
   if (!opts.enabled) {
     cached = null;
+    refreshCtx = null;
     return Promise.resolve(null);
   }
+  refreshCtx = { ctx, log: opts.log };
 
   // 1. Hydrate from disk cache so the classifier has something immediately.
-  const disk = ctx.globalState.get<CatalogCachePayload>(CATALOG_CACHE_KEY);
-  if (disk && Array.isArray(disk.entries) && disk.entries.length > 0) {
+  //    Rates come from the synced key (falling back to the pre-split payload
+  //    on first run after upgrade); the vendor map is always machine-local.
+  const local = ctx.globalState.get<CatalogCachePayload>(CATALOG_CACHE_KEY);
+  const synced = ctx.globalState.get<SyncedCatalogPayload>(CATALOG_SYNC_KEY);
+  const hasSynced = !!synced && Array.isArray(synced.entries) && synced.entries.length > 0;
+  const hasLegacy = !!local && Array.isArray(local.entries) && local.entries.length > 0;
+  const rates: SyncedCatalogPayload | undefined = hasSynced
+    ? synced
+    : hasLegacy
+      ? { fetchedAt: local!.fetchedAt, entries: local!.entries!, cdnProviders: local!.cdnProviders ?? {} }
+      : undefined;
+
+  if (rates) {
+    // A snapshot stamped in the future (clock skew across synced machines)
+    // would read as permanently fresh, so treat it as expired instead.
+    const fetchedAt = rates.fetchedAt > Date.now() ? 0 : rates.fetchedAt;
     cached = {
-      fetchedAt: disk.fetchedAt,
-      byId: new Map(disk.entries.map(e => [e.id.toLowerCase(), e])),
-      cdnProviders: disk.cdnProviders ?? {},
-      userVendorByModelId: new Map(disk.userVendorByModelId ?? []),
+      fetchedAt,
+      byId: new Map(rates.entries.map(e => [e.id.toLowerCase(), e])),
+      cdnProviders: rates.cdnProviders ?? {},
+      userVendorByModelId: new Map(local?.userVendorByModelId ?? []),
     };
     opts.log(
-      `modelCatalog: hydrated ${cached.byId.size} entries from cache (age=${Math.round(
-        (Date.now() - disk.fetchedAt) / 60000
-      )}min)`
+      `modelCatalog: hydrated ${cached.byId.size} entries from ${
+        hasSynced ? "synced" : "legacy local"
+      } cache (age=${Math.round((Date.now() - fetchedAt) / 60000)}min)`
     );
   }
 
@@ -443,11 +519,19 @@ export function loadCatalog(
 
   // 3. Network refresh — fire and (mostly) forget. The first successful
   //    response replaces `cached` and is persisted.
-  void refreshFromNetwork(ctx, opts.log).catch(err => {
-    opts.log(`modelCatalog: refresh failed silently — ${String(err)}`);
-  });
+  runRefresh(ctx, opts.log);
 
   return Promise.resolve(cached);
+}
+
+function runRefresh(ctx: vscode.ExtensionContext, log: LogFn): void {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  void refreshFromNetwork(ctx, log)
+    .catch(err => log(`modelCatalog: refresh failed silently — ${String(err)}`))
+    .finally(() => {
+      refreshInFlight = false;
+    });
 }
 
 // ─── Internal — network refresh ──────────────────────────────
@@ -551,13 +635,20 @@ async function refreshFromNetwork(ctx: vscode.ExtensionContext, log: LogFn): Pro
   };
   cached = next;
 
+  const entryList = Array.from(entries.values());
+  // Machine-local: only the vendor map. Rates live under the synced key so the
+  // two are never duplicated and a synced snapshot can never carry a vendor
+  // mapping from another machine.
   const payload: CatalogCachePayload = {
     fetchedAt: next.fetchedAt,
-    entries: Array.from(entries.values()),
-    cdnProviders,
     userVendorByModelId: Array.from(userVendorByModelId.entries()),
   };
   await ctx.globalState.update(CATALOG_CACHE_KEY, payload);
+  await ctx.globalState.update(CATALOG_SYNC_KEY, {
+    fetchedAt: next.fetchedAt,
+    entries: entryList,
+    cdnProviders,
+  } satisfies SyncedCatalogPayload);
 
   const cdnTotal = Object.values(cdnProviders).reduce((s, ids) => s + ids.length, 0);
   log(
