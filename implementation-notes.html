@@ -1007,5 +1007,78 @@ The cache is a snapshot of a set that grows without notice, so age is simply the
       <code>notifyUnknownModel()</code> actually fires.</li>
 </ul>
 
+<h2>2. Two-window AIC drift + startup double-counting (2026-08-04)</h2>
+
+<blockquote>
+User ran two separate VS Code windows on the same PC, each with its own workspace open, and saw two
+different AIC credit totals for the same billing cycle. Separately, one window briefly showed a number
+roughly double the eventual figure right after cold start, which corrected itself the moment the user
+sent a chat message.
+</blockquote>
+
+<h3>2a. Ruled out — cross-window / Settings Sync state</h3>
+<p>
+<code>src/machineSync.ts</code> publishes a per-machine rollup to <code>globalState</code>
+(<code>MACHINES_KEY</code>), read-modify-write, keyed by <code>vscode.env.machineId</code>. Two windows on
+the same PC share the same <code>machineId</code> and the same profile's <code>globalState</code> store, so
+they write to the <em>same</em> slot — there is no way for this to double a total. More importantly, the
+combined/cross-machine figure (<code>DashboardData.combinedCycleCredits</code> and
+<code>DATA.machines</code>) is never read by the hero KPI cards or the "AI Credits (AIC) — Usage-Based
+Billing" section — <code>dashboardPanel.ts</code> only renders the per-machine "Systems" table when
+<code>machines.length &gt; 1</code> (i.e. a genuinely different machine has reported), and that table is
+explicitly documented as informational-only, separate from the machine-local headline numbers. Confirmed by
+grepping for <code>combinedCycleCredits</code>/<code>.machines</code> across every UI file. This was the
+user's own working theory; it does not hold up against the code.</p>
+
+<h3>2b. Actual cause — cold-scan race with in-flight Copilot Chat writes</h3>
+<p>
+Both windows independently scan <em>all</em> of <code>workspaceStorage</code> on disk (by design, so the
+dashboard reflects total usage regardless of which window is open — see ARCHITECTURE.md). Each extension
+host keeps its own in-memory, per-process mtime cache (<code>_sessionBundleCache</code> /
+<code>_debugLogCache</code> in <code>scanner.ts</code>); nothing is persisted or shared across windows or
+restarts. <code>scanner.ts</code> already dedupes the known case of a chat-session file containing multiple
+rows for the same <code>(sessionId, turnIndex)</code> — an empty in-progress row plus the fully-populated
+row written once a turn settles (the <code>turnByKey</code> map, added after a prior +1,869-phantom-credit
+incident, see <code>tests/verify-no-drift.js</code>). That dedup can only work on rows that have already
+landed on disk. If a window's cold activation scan (<code>await runScan()</code> in
+<code>extension.ts activate()</code>) happens to run at the exact instant another window's Copilot Chat
+turn (or subagent chain) is mid-write, it can observe a transient, not-yet-settled duplicate and
+over-count it once. Running two windows makes this more likely simply because there are more
+workspaceStorage folders and more concurrently-active Copilot processes to catch mid-write. Sending a new
+message doesn't fix the old duplicate directly — it triggers the debug-log file watcher
+(<code>fireDebugLogScan</code> → <code>runScanSerialized</code>), which rescans everything, and by then
+VS Code's own chat storage has settled/compacted the previously in-flight file, so the recount comes out
+correct.</p>
+
+<h3>2c. Fix applied</h3>
+<p>
+Added a one-shot "settle" rescan ~5s after the initial activation scan in <code>extension.ts</code>
+(<code>activate()</code>), disposed via <code>context.subscriptions</code>. This re-runs <code>runScan()</code>
+and refreshes the status bar / dashboard once more shortly after cold start, so a transient duplicate from
+2b self-corrects automatically instead of requiring the user to send a message first.</p>
+<ul>
+  <li><strong>Design decision:</strong> 5s was chosen as a reasonable window for an in-flight turn to
+      finish writing without meaningfully delaying anything the user cares about (the initial scan already
+      renders immediately; this is a silent follow-up).</li>
+  <li><strong>Deviation:</strong> This does not eliminate the race, only shrinks the window in which a
+      user could see a stale/inflated number after cold start. A pathological case (a turn still streaming
+      5+ seconds after the window's own activation) would still show a transient number until the next
+      debug-log write or periodic rescan.</li>
+  <li><strong>Open question:</strong> If this proves insufficient in practice, a more robust fix would be
+      cross-referencing <code>child_session_ref</code> completeness before counting a session as final, but
+      that is a larger change to the scanner's session-bundling logic and wasn't warranted for a single
+      report.</li>
+</ul>
+
+<h2>3. Overage dollar figure — not a bug (2026-08-04)</h2>
+<p>
+User asked why <strong>26,892.4 credits</strong> spent produced an overage of only <strong>$238.92</strong>
+instead of the full <code>credits × $0.01</code> ($268.92). The "Overage" card is intentionally scoped to
+credits <em>above</em> the promo budget, per its own subtitle ("@ $0.01/credit over 3000 budget"):
+<code>(26892.4 − 3000) × 0.01 = $238.92</code>. The first 3000 credits/month are already covered by the plan
+and cost nothing extra — this is correct overage billing, not a display bug. There is currently no separate
+"total dollar value of all credits consumed" metric on the dashboard; only the overage-above-budget cost is
+shown.</p>
+
 </body>
 </html>

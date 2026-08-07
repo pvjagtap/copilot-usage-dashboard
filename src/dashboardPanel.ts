@@ -1000,16 +1000,22 @@ function renderAIC(aic, bounds, filteredSessions) {
   // prompt-token volume instead — always accurate and derived from sessions.
   const rangePromptTokens = filteredSessions.reduce((s,x) => s + (x.actualPrompt||x.prompt||0), 0);
   const projectedSub = aicRangeIsLive ? 'end of cycle' : 'range total (closed)';
+  // Gross value = every credit at face rate, with no budget subtracted — shown
+  // as a sub-line so it's never mistaken for the Overage cards below, which
+  // bill only the credits that exceed your plan's included allowance.
+  const overageCost = aic.config ? aic.config.overageCostPerCredit : 0.01;
+  const rangeGrossValue = rangeTotal * overageCost;
   const statsCards = [
-    {l:'Total Credits',v:rangeTotal.toFixed(1),s:planLabel+' plan',c:'orange'},
+    {l:'Total Credits',v:rangeTotal.toFixed(1),s:planLabel+' plan · $'+rangeGrossValue.toFixed(2)+' gross value',c:'orange'},
     {l:'Prompt Tokens',v:fmt(rangePromptTokens),s:'input to models'},
     {l:'Daily Avg',v:rangeDailyAvg.toFixed(1),s:activeDayCount+' active day'+(activeDayCount===1?'':'s')},
     {l:'Projected',v:rangeProjected.toFixed(0),s:projectedSub,c:aicRangeIsLive && projPct>=100?'red':aicRangeIsLive && projPct>=80?'orange':''},
   ];
 
-  // Overage card(s): recalculate from range-filtered total
+  // Overage card(s): recalculate from range-filtered total. "Overage" bills
+  // only credits ABOVE the included budget (1900/3000), not the gross value
+  // above — e.g. 27068 credits - 1900 included = 25168 billable * $0.01.
   let overageHTML = '';
-  const overageCost = aic.config ? aic.config.overageCostPerCredit : 0.01;
   if (isPromo) {
     const rangeOverageWithPromo = Math.max(0, rangeTotal - promo.promoBudget) * overageCost;
     const rangeOverageWithoutPromo = Math.max(0, rangeTotal - (promo.standardBudget||0)) * overageCost;

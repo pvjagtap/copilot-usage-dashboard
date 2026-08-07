@@ -275,15 +275,15 @@ export class StatusBarProvider {
         `| ${periodDonutMd(data.ranges.daily, legend, dpc)} | ${periodDonutMd(data.ranges.weekly, legend, dpc)} | ${periodDonutMd(data.ranges.month, legend, dpc)} |`,
       );
       if (legend.length > 0) {
-        // Each cell is nowrap so the ● stays glued to its model name; the ` · `
-        // separators are regular spaces so the browser wraps between cells
-        // when the row would exceed the tooltip's ~220 px width.
-        const legendCells = legend
-          .map((l) => `<span style="white-space:nowrap"><span style="color:${l.color}">●</span> ${escapeMd(l.model)}</span>`)
-          .join(" · ");
+        // One model per line (<br>-separated) so a growing legend from
+        // concurrent sessions stacks vertically instead of wrapping into a
+        // hard-to-scan run-on row.
+        const legendLines = legend
+          .map((l) => `<span style="color:${l.color}">●</span> ${escapeMd(l.model)}`)
+          .join("<br>");
         md.push("");
         md.push(
-          `<span style="color:${COL.muted}">${legendCells} · <span style="white-space:nowrap"><span style="color:${COL.accent2}">●</span> other</span></span>`
+          `<span style="color:${COL.muted}">${legendLines}<br><span style="color:${COL.accent2}">●</span> other</span>`
         );
       }
       md.push("");

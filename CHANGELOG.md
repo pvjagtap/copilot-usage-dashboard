@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.86] - 2026-08-05
+
+### Changed
+
+- The status bar tooltip's active-model legend (under the DAILY / WEEKLY /
+  THIS MONTH donuts) now lists one model per line instead of a single
+  dot-separated row. With multiple concurrent sessions the model list keeps
+  growing, and the run-on row was becoming hard to scan.
+
+## [1.10.85] - 2026-08-04
+
+### Changed
+
+- The AIC billing section's "Total Credits" card now shows a "$X gross value"
+  sub-line (credits × $/credit, no budget subtracted) next to the Overage
+  cards, which bill only credits above the plan's included allowance. The two
+  numbers look similar but mean different things, and showing just the
+  overage figure repeatedly read as "wrong" compared to the naive
+  credits × rate math.
+
+## [1.10.84] - 2026-08-04
+
+### Fixed
+
+- **Cold-start AIC totals could briefly read too high when Copilot Chat was
+  mid-write to a session/debug-log file at the exact moment the extension's
+  initial scan ran** — most visible with two VS Code windows open on the
+  same PC, since each window's own scan covers all of `workspaceStorage` and
+  there were twice as many concurrently-active Copilot processes to catch
+  mid-write. The existing `turnByKey` dedupe can only collapse duplicate rows
+  that have already landed on disk, so a still-settling turn could be counted
+  once too many until the next scan. Sending a message already fixed this
+  (the debug-log watcher forces a full rescan), but now a one-shot rescan
+  fires automatically ~5s after activation so the dashboard self-corrects
+  without needing user action.
+
 ## [1.10.83] - 2026-08-04
 
 ### Fixed

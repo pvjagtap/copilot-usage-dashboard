@@ -656,6 +656,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     },
   });
+
+  // Settle rescan. A `main.jsonl`/chatSession file that another window (or
+  // this one) is actively appending to at the exact moment the cold scan
+  // above ran can carry transient duplicate rows — an empty in-progress row
+  // plus the fully-populated one, or a subagent whose `child_session_ref`
+  // hadn't landed yet (see the turnByKey dedup note in scanner.ts). Those
+  // settle within a few seconds as Copilot Chat finishes writing, but
+  // without this the inflated cold-start total would sit on screen until
+  // the user sent a message and the debug-log watcher triggered a rescan.
+  // One extra rescan a few seconds after activation lets the mtime cache
+  // pick up the settled files and self-correct before any user action.
+  const settleTimer = setTimeout(() => {
+    void runScan().then(() => {
+      updateStatusBar();
+      DashboardPanel.updateIfVisible(buildData());
+    });
+  }, 5000);
+  context.subscriptions.push({ dispose: () => clearTimeout(settleTimer) });
 }
 
 /**
