@@ -1080,5 +1080,100 @@ and cost nothing extra — this is correct overage billing, not a display bug. T
 "total dollar value of all credits consumed" metric on the dashboard; only the overage-above-budget cost is
 shown.</p>
 
+<hr>
+
+<h1>Historical (pre-AIC) ranges showed 0.0 credits (2026-08-07)</h1>
+
+<h2>Symptom</h2>
+<p>
+Selecting <strong>May</strong> in the dashboard Range dropdown showed <code>AI Credits Spent = 0.0</code>
+and an empty "AI Credits by Model" table, even though the same view reported 214 sessions, 1,226 turns and
+1.69B prompt tokens. <strong>June</strong> rendered correctly (93,359 credits). Everything before
+<code>2026-06-01</code> was dead.</p>
+
+<h2>Root cause</h2>
+<p>
+<code>computeSessionViews()</code> in <code>src/dashboardData.ts</code> skipped every turn with
+<code>date &lt; AIC_EFFECTIVE_DATE</code> ("2026-06-01") when building <code>SessionView.aicCredits</code>.
+That field is the <em>only</em> credit source the webview has for historical ranges — <code>aicSummary.byDay</code>
+is clipped to the current billing cycle by <code>computeSummary()</code>, so for any past month the webview
+falls back to per-session credits. Zeroed sessions ⇒ zero month. June survived purely because its sessions
+carried <code>debugAicCredits</code> from <code>copilotUsageNanoAiu</code> <em>and</em> post-dated the gate.</p>
+
+<h2>Fixes</h2>
+<table>
+  <tr><th>File</th><th>Change</th></tr>
+  <tr><td><code>src/dashboardData.ts</code></td><td>Dropped the <code>AIC_EFFECTIVE_DATE</code> skip in
+      <code>computeSessionViews()</code>. Pre-June turns now fall through to the rate-table estimate
+      (they never carry <code>copilotUsageNanoAiu</code> — AIC billing did not exist yet).</td></tr>
+  <tr><td><code>src/dashboardData.ts</code></td><td>The rate-table fallback now passes
+      <code>t.debugCachedTokens</code> instead of a hardcoded <code>0</code>. Cache reads are a subset of
+      prompt tokens, so omitting them billed the entire prompt at full input price.</td></tr>
+  <tr><td><code>src/dashboardPanel.ts</code></td><td><code>renderAIC()</code> no longer early-returns on
+      <code>aic.totalCredits === 0</code> when the selected range has session credits — the cycle total
+      cannot gate a closed month.</td></tr>
+  <tr><td><code>src/dashboardPanel.ts</code></td><td><code>useOriginalByModel</code> now also requires that
+      no filtered session sits outside the current cycle. Previously "All Time" satisfied
+      <code>range ⊇ cycle</code> and silently rendered cycle-only <code>aic.byModel</code>.</td></tr>
+  <tr><td><code>src/dashboardPanel.ts</code></td><td>New pre-AIC provenance note: a range ending before
+      <code>2026-06-01</code> now says "Pre-AIC estimate" instead of "✓ Actual billing data".</td></tr>
+  <tr><td><code>src/sidebarSnapshot.ts</code></td><td>Session list filtered to the billing cycle. Its own
+      comment already claimed "top 30 by credits <em>within cycle</em>"; without the filter, un-gated
+      historical estimates would have flooded the panel.</td></tr>
+  <tr><td><code>tests/verify-webview-html.js</code></td><td>Stubs every <code>${…}</code> interpolation, not
+      just <code>${jsonData}</code>, so new host-side interpolations don't false-fail the parser check.</td></tr>
+</table>
+
+<h2>Measured effect</h2>
+<table>
+  <tr><th>Month</th><th>Before</th><th>After (no cache)</th><th>After (cache-aware)</th></tr>
+  <tr><td>2026-04</td><td class="bad">0.00</td><td>297,576</td><td>297,576</td></tr>
+  <tr><td>2026-05</td><td class="bad">0.00</td><td class="warn">866,926</td><td class="ok">270,817</td></tr>
+  <tr><td>2026-06</td><td>92,857</td><td>92,857</td><td>92,857</td></tr>
+</table>
+<p>April is unchanged by the cache-aware fix because its debug logs predate cache-token capture — there is
+nothing to discount.</p>
+
+<h2>Design decisions</h2>
+<ul>
+  <li><strong>Estimate, not silence.</strong> Pre-June credits are reconstructed from token counts at
+      published per-model rates. GitHub never billed them, so the number is a valuation, not an invoice.
+      The alternative — keep showing 0 — hides real usage, which is what the user objected to.</li>
+  <li><strong>Provenance is surfaced, not buried.</strong> The "Pre-AIC estimate" note is keyed off
+      <code>bounds.end &lt; AIC_START</code> so a mixed range (e.g. Last 90 Days) still shows the normal
+      note rather than mislabelling current-cycle actuals as estimates.</li>
+  <li><strong>The gate was left in place everywhere else.</strong> <code>creditEntries</code>,
+      <code>aicSummary</code>, the CLI/OMP/Pi paths and the budget/overage math all still start at
+      <code>2026-06-01</code>. Only the per-session display field was un-gated — budget math must never
+      absorb an estimate for a period GitHub did not bill.</li>
+</ul>
+
+<h2>Tradeoffs</h2>
+<ul>
+  <li>Pre-AIC estimates use whatever rate card is loaded <em>today</em>, not the rates in force in April.
+      Historically accurate rate cards aren't available locally; the drift is accepted.</li>
+  <li>The historical model table renders em-dash for input/output/cached splits. Session-level totals are
+      the only granularity available for closed periods — a fabricated split would be worse than blank.</li>
+</ul>
+
+<h2>Open questions</h2>
+<ul>
+  <li>Should pre-AIC months be visually tagged (e.g. a hatched calendar or an "est." suffix on the hero
+      card) rather than only carrying the footnote? Left out pending user preference.</li>
+  <li>April's missing cache tokens make its estimate an upper bound roughly 3× above what a comparable
+      cache-aware month reports. Worth flagging in-UI, or acceptable as-is?</li>
+</ul>
+
+<h2>Verification</h2>
+<table>
+  <tr><th>Check</th><th>Result</th></tr>
+  <tr><td><code>tsc -p ./</code></td><td class="ok">clean</td></tr>
+  <tr><td><code>eslint src/**/*.ts</code></td><td class="ok">clean</td></tr>
+  <tr><td><code>tests/verify-historical-range-credits.js</code> (new)</td><td class="ok">2/2 pre-AIC months report credits</td></tr>
+  <tr><td><code>tests/verify-webview-html.js</code></td><td class="ok">inline script parses</td></tr>
+  <tr><td><code>tests/verify-sidebar-dashboard-parity.js</code></td><td class="warn">13/14 — the single
+      <code>byModel.length ≤ 5</code> failure was reproduced on stashed <code>main</code> before these edits</td></tr>
+</table>
+
 </body>
 </html>

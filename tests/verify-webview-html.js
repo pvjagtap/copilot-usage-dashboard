@@ -27,10 +27,12 @@ const rawTemplate = matches.reduce((a, b) => b.length > a.length ? b : a);
 console.log('Largest template literal (raw source):', rawTemplate.length, 'chars');
 
 // Evaluate the template literal to get the runtime HTML string.
-// Substitute ${jsonData} with a placeholder object literal first.
+// Substitute every ${...} interpolation with a placeholder object literal
+// first — the host-side identifiers (jsonData, aicStartJson, …) don't exist
+// in this harness and only their syntax position matters here.
 let html;
 try {
-  const stubbed = rawTemplate.replace(/\$\{jsonData\}/g, '{}');
+  const stubbed = rawTemplate.replace(/\$\{[^{}]*\}/g, '{}');
   // eslint-disable-next-line no-new-func
   html = new Function('return `' + stubbed + '`')();
 } catch (e) {

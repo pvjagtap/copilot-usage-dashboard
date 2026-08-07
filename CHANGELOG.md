@@ -5,6 +5,99 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.90] - 2026-08-07
+
+### Fixed
+
+- Re-audit of billing-era display. The AIC section still rendered the
+  "Usage-Based Billing" title, PROMO tag, credit budget bar and USD
+  overage cards for pre-AIC ranges (April / May 2026), even though
+  GitHub billed premium requests against a per-plan allowance in that
+  era, not credits. That was a real regression: users looking at May
+  saw a "$951 overage" computed against a 3000-credit budget that
+  didn't exist yet.
+
+### Added
+
+- Pre-AIC ranges now render a dedicated **Premium Request Billing**
+  panel at the top of the AIC section: premium-requests-used bar
+  vs. the plan's `includedPremiumRequests` allowance (300 for Business,
+  1000 Enterprise, 1500 Pro+, 3000 Max) and an overage card at the
+  historical rate of $0.04 per premium request over the allowance.
+  The AIC credit reconstruction is still shown below, but now clearly
+  labelled "rate-table reconstruction" so it is not mistaken for the
+  invoice amount. Section title changes to "Billing Detail (Pre-AIC)".
+- `AICDashboardData.includedPremiumRequests` plumbed from
+  `PLAN_SPECS` through `buildDashboardData()` to the webview so the
+  panel doesn't have to hardcode plan allowances.
+
+### Verified
+
+- `tests/audit-billing-era-split.js` confirms every era renders the
+  right headline: May → "Premium Requests" hero + premium-request
+  panel; July → "AI Credits Spent" hero + credit budget bar; August
+  → same as July (current cycle, live projections).
+
+## [1.10.89] - 2026-08-07
+
+### Fixed
+
+- "AI Credits by Model" input/output/cached columns rendered em-dash for
+  every historical range (June, July, all pre-AIC months). The webview
+  had per-request credit splits only for the current billing cycle and
+  fell back to session totals, which don't carry a credit-side split.
+  The historical fallback now aggregates session-level token counts
+  (`actualPrompt`, `actualOutput`, `actualCached`) per model and
+  apportions each row's credit total by the input / output / cached
+  token ratio. Result: the split columns populate for every range,
+  totals still reconcile with the hero and the calendar month total.
+
+## [1.10.88] - 2026-08-07
+
+### Fixed
+
+- Hero "AI Credits Spent" tile and the AIC section's "Total Credits" card
+  disagreed for historical months (July: hero 38,050 vs section 98,135, both
+  from the same data). The hero's per-day accumulation was guarded by
+  `!(lastDate in map)`, so the first session on any day set the entry and
+  every other session on that day was silently dropped. Both surfaces now
+  share a single `buildRangeDayMap()` helper that accumulates all sessions
+  per day, guaranteeing hero ≡ section ≡ calendar total for every range.
+
+### Changed
+
+- Ranges ending before 2026-06-01 now show "Premium Requests" (turns ×
+  multiplier) as the hero metric instead of "AI Credits Spent". Pre-AIC
+  GitHub billed premium requests, not credits — the credit reconstruction
+  is still available under the AIC section with its estimate banner, but
+  the headline number now reflects what actually appeared on the invoice.
+- Pre-AIC overage card shows "Overage (n/a)" with an explanatory sub-line
+  instead of computing a credit overage against a budget that didn't exist.
+
+## [1.10.87] - 2026-08-07
+
+### Fixed
+
+- Historical ranges (any month before 2026-06-01) showed `0.0` AI Credits and
+  an empty model table despite reporting full session, turn and prompt-token
+  counts. `computeSessionViews()` skipped every turn dated before the AIC
+  effective date when building per-session credits — and that field is the
+  only credit source the dashboard has for closed periods, since
+  `aicSummary.byDay` is clipped to the current billing cycle.
+- The rate-table estimate used for turns without API-reported credits now
+  accounts for cache-read tokens instead of billing the entire prompt at full
+  input price. May 2026 dropped from an implausible 866k credits to 271k.
+- "All Time" and multi-month ranges rendered the current cycle's per-model
+  breakdown, silently dropping every historical credit from the table.
+- The AI Credits section no longer disappears for a past month when the
+  current billing cycle happens to be empty.
+
+### Added
+
+- Ranges that end before 2026-06-01 now carry a "Pre-AIC estimate" note so
+  reconstructed credits are never mistaken for GitHub-billed actuals. Budget,
+  overage and projection math remain scoped to the AIC era.
+
 ## [1.10.86] - 2026-08-05
 
 ### Changed

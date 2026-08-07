@@ -361,7 +361,7 @@ export function buildSidebarSnapshot(input: SidebarBuildInput): SidebarSnapshot 
   // since activationTime. Best-effort match — sidebar just shows a glyph.
   const activeShort = pickActiveSessionShort(dashData.sessionsAll, activationTime);
   const sessionsSorted = [...dashData.sessionsAll]
-    .filter(s => s.aicCredits > 0)
+    .filter(s => s.aicCredits > 0 && !!s.lastDate && s.lastDate >= cycleStart && s.lastDate <= cycleEnd)
     .sort((a, b) => b.aicCredits - a.aicCredits);
   const rows: SidebarSessionRow[] = sessionsSorted.slice(0, 30).map(s => ({
     sessionId: s.sessionId,

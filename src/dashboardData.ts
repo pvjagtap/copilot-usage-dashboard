@@ -318,6 +318,8 @@ export interface AICDashboardData {
   cachedCredits: number;
   planName: string;
   monthlyBudget: number;
+  /** Legacy pre-AIC allowance: premium requests included per user/month (typically 300 for Business). */
+  includedPremiumRequests: number;
   creditsRemaining: number;
   estimatedOverageCost: number;
   billingCycleStart: string;
@@ -534,22 +536,32 @@ function computeSessionViews(sessions: Session[], toolCalls: ToolCall[], turns: 
     }
   }
 
-  // Per-session AIC credits (only for turns on/after AIC_EFFECTIVE_DATE)
-  // Prefer actual API-reported AIC (debugAicCredits) over computed from rates
+  // Per-session AIC credits, computed for EVERY turn regardless of date.
+  // Prefer actual API-reported AIC (debugAicCredits) over computed from rates.
+  //
+  // Pre-2026-06-01 turns predate AIC billing so they never carry
+  // `copilotUsageNanoAiu` — they fall through to the rate-table estimate.
+  // The `date < AIC_EFFECTIVE_DATE` skip that used to live here zeroed those
+  // sessions, and since the dashboard's historical ranges are built from
+  // `SessionView.aicCredits` (the `aicSummary.byDay` map only covers the
+  // current billing cycle), every month before June rendered 0.0 credits
+  // despite having full token data.
   const sessionCreditsMap = new Map<string, number>();
   for (const t of turns) {
     if (!t.timestamp) { continue; }
-    const date = t.timestamp.slice(0, 10);
-    if (date < AIC_EFFECTIVE_DATE) { continue; }
     let credits: number;
     if (t.debugAicCredits > 0) {
       // Use actual API-reported AIC (includes cache discounts)
       credits = t.debugAicCredits;
     } else {
-      // Fallback: compute from rates (upper-bound, no cache info)
+      // Fallback: rate-table estimate. Cache-read tokens are a subset of
+      // prompt tokens, so passing them lets the calculator apply the cached
+      // rate instead of billing the whole prompt at full input price —
+      // without it a cache-heavy pre-AIC month over-reports by ~10x.
       const inputTokens = t.debugPromptTokens || t.promptTokens;
       const outputTokens = t.debugOutputTokens || t.outputTokens;
-      credits = calculator.calculateCredits(t.modelFamily || "unknown", inputTokens, outputTokens, 0).totalCredits;
+      const cachedTokens = t.debugCachedTokens || 0;
+      credits = calculator.calculateCredits(t.modelFamily || "unknown", inputTokens, outputTokens, cachedTokens).totalCredits;
     }
     sessionCreditsMap.set(t.sessionId, (sessionCreditsMap.get(t.sessionId) ?? 0) + credits);
   }
@@ -1529,6 +1541,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     cachedCredits: Math.round(summary.cachedCredits * 100) / 100,
     planName: summary.plan.planName,
     monthlyBudget: effectiveBudget,
+    includedPremiumRequests: summary.plan.includedPremiumRequests,
     creditsRemaining: Math.round(effectiveRemaining * 100) / 100,
     estimatedOverageCost: Math.round(effectiveOverage * 100) / 100,
     billingCycleStart: summary.billingCycleStart,

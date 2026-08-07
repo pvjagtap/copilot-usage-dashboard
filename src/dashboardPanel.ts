@@ -6,7 +6,7 @@
  */
 
 import * as vscode from "vscode";
-import { DashboardData } from "./dashboardData";
+import { DashboardData, AIC_EFFECTIVE_DATE } from "./dashboardData";
 
 export class DashboardPanel {
   private static instance: DashboardPanel | undefined;
@@ -66,6 +66,7 @@ export class DashboardPanel {
 
   private buildHtml(data: DashboardData): string {
     const jsonData = JSON.stringify(data);
+    const aicStartJson = JSON.stringify(AIC_EFFECTIVE_DATE);
 
     return /*html*/ `<!DOCTYPE html>
 <html lang="en">
@@ -378,6 +379,9 @@ td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
 
 <script>
 let DATA = ${jsonData};
+// Date GitHub started billing AI Credits. Ranges that end before it can only
+// ever be rate-table estimates — no request in them carries copilotUsageNanoAiu.
+const AIC_START = ${aicStartJson};
 const MODEL_COLORS = ['#58a6ff','#3fb950','#bc8cff','#d29922','#f85149','#79c0ff','#f778ba','#a5d6ff'];
 const RANGE_LABELS = {'7d':'Last 7 Days','30d':'Last 30 Days','90d':'Last 90 Days','tw':'This Week','tm':'This Month','pm':'Prev Month','jan':'January','feb':'February','mar':'March','apr':'April','may':'May','jun':'June','jul':'July','aug':'August','sep':'September','oct':'October','nov':'November','dec':'December','all':'All Time'};
 
@@ -397,6 +401,31 @@ let charts = {};
 let renderPending = false;
 let renderWhenVisible = false;
 function _saveState() { vscode.setState({ selectedRange, selectedRefresh, selectedModels: Array.from(selectedModels), selectedTz }); }
+
+// Single per-day AIC credit map used by both the hero KPIs and the AIC
+// section, so the "AI Credits Spent" tile and the "Total Credits" card can
+// never disagree again (v1.10.87 shipped a hero-only accumulation bug that
+// dropped every duplicate-day session in historical ranges — July hero
+// showed 38050, AIC section showed 98135 from the same data). aic.byDay is
+// clipped to the current billing cycle; sessions fill days outside it.
+function buildRangeDayMap(bounds, sessions, aic) {
+  const map = {};
+  (aic && aic.byDay || []).forEach(d => {
+    if ((!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end)) {
+      map[d.day] = d.credits;
+    }
+  });
+  const sessionByDay = {};
+  sessions.forEach(s => {
+    if (s.lastDate && s.aicCredits) {
+      sessionByDay[s.lastDate] = (sessionByDay[s.lastDate] || 0) + s.aicCredits;
+    }
+  });
+  Object.entries(sessionByDay).forEach(([day, credits]) => {
+    if (!(day in map)) { map[day] = credits; }
+  });
+  return map;
+}
 
 function fmt(n) {
   if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
@@ -627,22 +656,10 @@ function render() {
   const refreshStatus = selectedRefresh > 0 ? '' : ' (auto-refresh off)';
   document.getElementById('subtitle').textContent = 'Updated: '+DATA.generatedAt+' — '+rl+refreshStatus;
 
-  // Authoritative per-day credit map for the selected range. aic.byDay is
-  // built from computeSummary(creditEntries) and already includes every
-  // source (VS Code turns + live OTel overlay + OMP + Pi + CLI), so the
-  // dashboard reconciles with the sidebar. Session fallback fills days
-  // outside the current billing cycle (past months where byDay is empty).
-  const rangeAicDayMap = {};
-  (DATA.aicSummary && DATA.aicSummary.byDay || []).forEach(d => {
-    if ((!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end)) {
-      rangeAicDayMap[d.day] = d.credits;
-    }
-  });
-  sessions.forEach(s => {
-    if (s.lastDate && s.aicCredits && !(s.lastDate in rangeAicDayMap)) {
-      rangeAicDayMap[s.lastDate] = (rangeAicDayMap[s.lastDate] || 0) + s.aicCredits;
-    }
-  });
+  // Per-day credit map — MUST be built via the shared helper so the hero's
+  // "AI Credits Spent" tile equals the AIC section's "Total Credits" card
+  // for every range. See buildRangeDayMap() for the invariant.
+  const rangeAicDayMap = buildRangeDayMap(bounds, sessions, DATA.aicSummary);
   const rangeAicTotal = Object.values(rangeAicDayMap).reduce((s, v) => s + v, 0);
   const aicTotal = rangeAicTotal.toFixed(1);
   const aicBudget = DATA.aicSummary ? DATA.aicSummary.monthlyBudget : 0;
@@ -651,6 +668,17 @@ function render() {
   const aicSrcSub = (ag && (ag.ompSessions > 0 || ag.piSessions > 0 || ag.cliSessions > 0))
     ? 'VS Code+OMP+Pi+CLI (all sources)'
     : aicSub;
+
+  // Pre-AIC ranges: GitHub billed premium requests (turns × multiplier), not
+  // credits. Show the era-correct metric on the hero card so users looking
+  // at April/May see what actually appeared on their invoice, not a
+  // reconstruction under a misleading "AI Credits Spent" label.
+  const rangeIsPreAic = !!bounds.end && bounds.end < AIC_START;
+  const heroLabel = rangeIsPreAic ? 'Premium Requests' : 'AI Credits Spent';
+  const heroValue = rangeIsPreAic ? Math.round(t.premium).toLocaleString() : aicTotal;
+  const heroSub = rangeIsPreAic
+    ? rl + ' · pre-AIC · turns × multiplier'
+    : rl + ' · ' + t.sessions + ' sessions · ' + t.turns + ' turns';
 
   // === HERO KPIs (4 headline cards with deltas & accent stripes) ===
   const heroActiveDayCount = Object.keys(rangeAicDayMap).length || 1;
@@ -698,20 +726,22 @@ function render() {
   const isPromo = promo.isPromoActive && promo.promoBudget > 0;
   const overageCost = DATA.aicSummary?.config?.overageCostPerCredit ?? 0.01;
   const effectiveBudget = isPromo ? promo.promoBudget : (DATA.aicSummary?.monthlyBudget || 0);
-  const rangeOverageDollars = effectiveBudget > 0
-    ? Math.max(0, rangeAicTotal - effectiveBudget) * overageCost
-    : 0;
-  const overageLabel = isPromo ? 'Overage (with promo)' : 'Overage';
-  const overageSub = effectiveBudget > 0
-    ? '@ $' + overageCost + '/credit over ' + effectiveBudget + ' budget'
-    : 'no budget set';
+  const rangeOverageDollars = rangeIsPreAic || effectiveBudget <= 0
+    ? 0
+    : Math.max(0, rangeAicTotal - effectiveBudget) * overageCost;
+  const overageLabel = rangeIsPreAic ? 'Overage (n/a)' : isPromo ? 'Overage (with promo)' : 'Overage';
+  const overageSub = rangeIsPreAic
+    ? 'pre-AIC — GitHub billed premium requests, not credits'
+    : effectiveBudget > 0
+      ? '@ $' + overageCost + '/credit over ' + effectiveBudget + ' budget'
+      : 'no budget set';
   const paceSub = heroActiveDayCount + ' active day' + (heroActiveDayCount === 1 ? '' : 's');
   const projectedValue = rangeIsLive ? Math.round(heroProjected).toLocaleString() : rangeAicTotal.toFixed(0);
   const projectedSub = rangeIsLive ? 'end of cycle' : 'range total (closed)';
   const projectedAccent = rangeIsLive && projPct >= 100 ? 'orange' : rangeIsLive && projPct >= 80 ? 'orange' : 'green';
 
   document.getElementById('hero-stats').innerHTML = [
-    {l:'AI Credits Spent', v:aicTotal,                              sub: rl + ' · ' + t.sessions + ' sessions · ' + t.turns + ' turns', accent:'orange', delta:spendDelta},
+    {l:heroLabel,          v:heroValue,                              sub: heroSub, accent:'orange', delta:spendDelta},
     {l:overageLabel,       v:'$'+rangeOverageDollars.toFixed(2),    sub: overageSub, accent:'red', delta:''},
     // Cache Hit formula MUST match cache.ts (single source of truth). The
     // arithmetic is inlined here only because the aggregate is built from a
@@ -924,28 +954,17 @@ function buildCreditCalendar(cycleStart, cycleEnd, dayMap) {
 
 function renderAIC(aic, bounds, filteredSessions) {
   const el = document.getElementById('aic-section');
-  if (!aic || aic.totalCredits === 0) {
+  // aic.totalCredits only covers the current billing cycle, so it cannot
+  // gate historical ranges — a closed month with session credits must still
+  // render even when the live cycle is empty.
+  const hasRangeCredits = filteredSessions.some(s => s.aicCredits > 0);
+  if (!aic || (aic.totalCredits === 0 && !hasRangeCredits)) {
     el.innerHTML = '<div class="table-card"><div class="section-head"><div class="section-title">AI Credits (AIC)</div><div class="section-subtitle">No usage data yet</div></div><div class="empty-panel">AI Credits will be calculated once token usage data is available. Configure your plan in Settings → Copilot Usage.</div></div>';
     return;
   }
 
-  // Build authoritative per-day credit map first. aic.byDay already blends
-  // VS Code turns + live OTel overlay + OMP + Pi + CLI (from
-  // computeSummary(creditEntries)), so summing it makes this section
-  // reconcile with the sidebar. Session aggregation fills days outside the
-  // current cycle (past months where byDay is empty).
-  const sessionDayMap = {};
-  filteredSessions.forEach(s => {
-    if (s.lastDate && s.aicCredits) {
-      sessionDayMap[s.lastDate] = (sessionDayMap[s.lastDate] || 0) + s.aicCredits;
-    }
-  });
-  const filteredByDay = (aic.byDay||[]).filter(d => (!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end));
-  const finalDayMap = {};
-  filteredByDay.forEach(d => { finalDayMap[d.day] = d.credits; });
-  Object.entries(sessionDayMap).forEach(([day, credits]) => {
-    if (!(day in finalDayMap)) { finalDayMap[day] = credits; }
-  });
+  // Per-day credit map shared with the hero — see buildRangeDayMap.
+  const finalDayMap = buildRangeDayMap(bounds, filteredSessions, aic);
   const rangeTotal = Object.values(finalDayMap).reduce((s, v) => s + v, 0);
 
   // Daily average from days that actually had activity — accurate for any range.
@@ -1033,11 +1052,16 @@ function renderAIC(aic, bounds, filteredSessions) {
   }
 
   // Model breakdown table — computed from range-filtered sessions.
-  // For the current billing cycle we have per-request input/output/cached
-  // splits (in aic.byModel). For historical ranges we only have session-level
-  // total credits — so we render em-dash in the split columns to avoid showing
-  // misleading 0.00 values.
-  const useOriginalByModel = !bounds.start || (bounds.start <= aic.billingCycleStart && (!bounds.end || bounds.end >= aic.billingCycleEnd));
+  // aic.byModel carries per-request input/output/cached splits but only for
+  // the current billing cycle. It is therefore usable only when the range
+  // covers that cycle AND pulls in nothing outside it — otherwise (All Time,
+  // a past month) it would silently drop every historical credit. The
+  // fallback aggregates session-level totals, which have no split, so those
+  // columns render em-dash rather than a misleading 0.00.
+  const coversCycle = !bounds.start || (bounds.start <= aic.billingCycleStart && (!bounds.end || bounds.end >= aic.billingCycleEnd));
+  const hasCreditsOutsideCycle = filteredSessions.some(s =>
+    s.aicCredits > 0 && s.lastDate && (s.lastDate < aic.billingCycleStart || s.lastDate > aic.billingCycleEnd));
+  const useOriginalByModel = coversCycle && !hasCreditsOutsideCycle;
   let modelRows = '';
   if (useOriginalByModel) {
     (aic.byModel||[]).forEach(m => {
@@ -1045,21 +1069,37 @@ function renderAIC(aic, bounds, filteredSessions) {
       modelRows += '<tr><td><span class="model-tag '+mc(m.model)+'">'+esc(m.model)+'</span> '+tierBadge+'</td><td class="num">'+m.inputCredits.toFixed(2)+'</td><td class="num">'+m.outputCredits.toFixed(2)+'</td><td class="num cached">'+m.cachedCredits.toFixed(2)+'</td><td class="num orange">'+m.totalCredits.toFixed(2)+'</td></tr>';
     });
   } else {
-    // Historical range: aggregate session credits by model, no split available
-    const modelTotals = {};
+    // Historical range: aic.byModel has no per-request splits for out-of-cycle
+    // months. Aggregate session totals per model and apportion the credit total
+    // by the session-level input / output / cached token counts. This is an
+    // approximation (it ignores per-model rate differences between the three
+    // buckets) but it is the honest thing to show — the split has the same
+    // ratio as the underlying token counts that GitHub billed against.
+    const modelData = {};
     const tierMap = {};
     (aic.byModel||[]).forEach(bm => { tierMap[bm.model] = bm.tier; });
     filteredSessions.forEach(s => {
       const m = s.model || s.modelName || 'unknown';
-      modelTotals[m] = (modelTotals[m] || 0) + (s.aicCredits || 0);
+      const row = modelData[m] || (modelData[m] = {total:0, tokensIn:0, tokensOut:0, tokensCached:0});
+      row.total += (s.aicCredits || 0);
+      row.tokensIn += (s.actualPrompt || s.prompt || 0);
+      row.tokensOut += (s.actualOutput || s.output || 0);
+      row.tokensCached += (s.actualCached || 0);
     });
-    Object.entries(modelTotals)
-      .filter(([,total]) => total > 0)
-      .sort((a,b) => b[1] - a[1])
-      .forEach(([m, total]) => {
+    Object.entries(modelData)
+      .filter(([,r]) => r.total > 0)
+      .sort((a,b) => b[1].total - a[1].total)
+      .forEach(([m, r]) => {
         const tier = tierMap[m] || '';
         const tierBadge = tier === 'premium' ? '<span class="mult-badge mult-high">premium</span>' : tier === 'base' ? '<span class="mult-badge mult-1">base</span>' : '<span class="mult-badge">custom</span>';
-        modelRows += '<tr><td><span class="model-tag '+mc(m)+'">'+esc(m)+'</span> '+tierBadge+'</td><td class="num" style="color:var(--muted)">—</td><td class="num" style="color:var(--muted)">—</td><td class="num" style="color:var(--muted)">—</td><td class="num orange">'+total.toFixed(2)+'</td></tr>';
+        const denom = r.tokensIn + r.tokensOut + r.tokensCached;
+        const inCr  = denom > 0 ? r.total * r.tokensIn     / denom : 0;
+        const outCr = denom > 0 ? r.total * r.tokensOut    / denom : 0;
+        const caCr  = denom > 0 ? r.total * r.tokensCached / denom : 0;
+        const cellIn  = denom > 0 ? inCr.toFixed(2)  : '<span style="color:var(--muted)">—</span>';
+        const cellOut = denom > 0 ? outCr.toFixed(2) : '<span style="color:var(--muted)">—</span>';
+        const cellCa  = denom > 0 ? caCr.toFixed(2)  : '<span style="color:var(--muted)">—</span>';
+        modelRows += '<tr><td><span class="model-tag '+mc(m)+'">'+esc(m)+'</span> '+tierBadge+'</td><td class="num">'+cellIn+'</td><td class="num">'+cellOut+'</td><td class="num cached">'+cellCa+'</td><td class="num orange">'+r.total.toFixed(2)+'</td></tr>';
       });
   }
 
@@ -1069,12 +1109,46 @@ function renderAIC(aic, bounds, filteredSessions) {
   const calEnd = bounds.end || aic.billingCycleEnd;
   const calendarHTML = buildCreditCalendar(calStart, calEnd, finalDayMap);
 
-  // Estimation note
-  const cacheNote = aic.isActualFromApi
+  // Estimation note. A range that closed before AIC billing began can only be
+  // a rate-table estimate, no matter what the current cycle's data looks like.
+  const rangeIsPreAic = !!bounds.end && bounds.end < AIC_START;
+  const cacheNote = rangeIsPreAic
+    ? '<div style="margin-top:8px;padding:6px 10px;background:var(--border);border-radius:4px;font-size:10px;color:var(--muted)">⚠️ <strong>Pre-AIC estimate:</strong> AI Credits billing started '+AIC_START+'. Credits for this period are reconstructed from token counts at published per-model rates — GitHub did not bill them.</div>'
+    : aic.isActualFromApi
     ? '<div style="margin-top:8px;padding:6px 10px;background:var(--border);border-radius:4px;font-size:10px;color:#4ec9b0">✓ <strong>Actual billing data:</strong> Credits sourced from API-reported copilotUsageNanoAiu per request. Includes cache discounts.</div>'
     : aic.cachedCredits === 0
     ? '<div style="margin-top:8px;padding:6px 10px;background:var(--border);border-radius:4px;font-size:10px;color:var(--muted)">⚠️ <strong>Estimate:</strong> Computed from published per-model rates. Does not include cache-write costs (~5-10% undercount for Anthropic models). Check GitHub billing for exact usage.</div>'
     : '';
+
+  // Pre-AIC panel: for ranges that closed before 2026-06-01, GitHub billed
+  // premium requests (turns × multiplier) against a plan allowance, NOT
+  // credits. Compute that view here so users see the era-correct headline.
+  // The AIC reconstruction below is still shown for reference.
+  const preAicPanel = (() => {
+    if (!rangeIsPreAic) return '';
+    const premiumReqs = filteredSessions.reduce((s, x) => s + getMult(x.modelName, x.multiplier) * (x.turns || 0), 0);
+    const included = aic.includedPremiumRequests || 0;
+    const overReqs = Math.max(0, premiumReqs - included);
+    // Pre-AIC overage was $0.04 per premium request over allowance for all paid plans.
+    const preAicOverDollars = overReqs * 0.04;
+    const pctPre = included > 0 ? Math.min(100, Math.round((premiumReqs / included) * 100)) : 0;
+    const pctPreActual = included > 0 ? Math.round((premiumReqs / included) * 100) : 0;
+    const barCol = pctPreActual >= 100 ? 'var(--red)' : pctPreActual >= 85 ? 'var(--orange)' : pctPreActual >= 50 ? 'var(--green)' : 'var(--blue)';
+    const preBar = included > 0
+      ? '<div style="margin:14px 0"><div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:6px"><span>'+Math.round(premiumReqs)+' / '+included+' premium requests used</span><span style="font-weight:600">'+pctPreActual+'%</span></div><div class="budget-bar"><div class="fill" style="width:'+pctPre+'%;background:'+barCol+'"></div></div></div>'
+      : '';
+    return '<div style="margin-top:8px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:rgba(255,255,255,0.02)">'
+      + '<div class="section-title" style="margin-bottom:4px">Premium Request Billing (pre-AIC · what GitHub actually charged)</div>'
+      + '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">Before 2026-06-01, GitHub billed <strong>premium requests</strong> — one per user turn, weighted by the model multiplier — against a per-user monthly allowance. Overage was $0.04 per premium request over the allowance.</div>'
+      + preBar
+      + '<div class="stats-row">'
+      + '<div class="stat-card"><div class="label">Premium Requests</div><div class="value orange">'+Math.round(premiumReqs).toLocaleString()+'</div><div class="sub">turns × multiplier</div></div>'
+      + '<div class="stat-card"><div class="label">Included</div><div class="value">'+included.toLocaleString()+'</div><div class="sub">'+planLabel+' plan allowance</div></div>'
+      + '<div class="stat-card"><div class="label">Overage Requests</div><div class="value'+(overReqs > 0 ? ' orange' : '')+'">'+Math.round(overReqs).toLocaleString()+'</div><div class="sub">above allowance</div></div>'
+      + '<div class="stat-card"><div class="label">Overage Cost</div><div class="value'+(preAicOverDollars > 0 ? ' red' : '')+'">$'+preAicOverDollars.toFixed(2)+'</div><div class="sub">@ $0.04/premium request</div></div>'
+      + '</div>'
+      + '</div>';
+  })();
 
   // Non-billable models panel (issue #5)
   // Surfaces local Ollama / LM Studio / BYOK / unrecognised model usage as
@@ -1206,13 +1280,21 @@ function renderAIC(aic, bounds, filteredSessions) {
       + '</div>';
   }
 
-  el.innerHTML = '<div class="table-card"><div class="section-head"><div class="section-title">AI Credits (AIC) — Usage-Based Billing'+promoTag+'</div><div class="section-subtitle">Cycle: '+esc(aic.billingCycleStart)+' to '+esc(aic.billingCycleEnd)+' • '+planLabel+' Plan</div></div>'
-    + budgetBar
-    + '<div class="stats-row">' + statsCards.map(c=>'<div class="stat-card"><div class="label">'+c.l+'</div><div class="value'+(c.c?' '+c.c:'')+'">'+c.v+'</div><div class="sub">'+c.s+'</div></div>').join('') + '</div>'
-    + overageHTML
+  const sectionTitle = rangeIsPreAic
+    ? 'Billing Detail (Pre-AIC · Premium Requests + AIC Reconstruction)'
+    : 'AI Credits (AIC) — Usage-Based Billing' + promoTag;
+  const modelTableTitle = rangeIsPreAic
+    ? 'AI Credits by Model (rate-table reconstruction)'
+    : 'AI Credits by Model';
+
+  el.innerHTML = '<div class="table-card"><div class="section-head"><div class="section-title">'+sectionTitle+'</div><div class="section-subtitle">Cycle: '+esc(aic.billingCycleStart)+' to '+esc(aic.billingCycleEnd)+' • '+planLabel+' Plan</div></div>'
+    + preAicPanel
+    + (rangeIsPreAic ? '' : budgetBar)
+    + (rangeIsPreAic ? '' : '<div class="stats-row">' + statsCards.map(c=>'<div class="stat-card"><div class="label">'+c.l+'</div><div class="value'+(c.c?' '+c.c:'')+'">'+c.v+'</div><div class="sub">'+c.s+'</div></div>').join('') + '</div>')
+    + (rangeIsPreAic ? '' : overageHTML)
     + cacheNote
     + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:12px">'
-    + '<div><div class="section-title" style="margin-bottom:8px">AI Credits by Model</div><table><thead><tr><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cached</th><th class="num">Total</th></tr></thead><tbody>'+modelRows+'</tbody></table></div>'
+    + '<div><div class="section-title" style="margin-bottom:8px">'+modelTableTitle+'</div><table><thead><tr><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cached</th><th class="num">Total</th></tr></thead><tbody>'+modelRows+'</tbody></table></div>'
     + '<div>'+calendarHTML+'</div>'
     + '</div>'
     + nonBillableHTML
