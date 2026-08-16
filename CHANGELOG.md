@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.99] - 2026-08-15
+
+### Fixed
+
+- **Projects still rendered as `workspace-<hash8>` despite the 1.10.98 naming
+  fix.** `rememberWorkspaceName` keyed the registry on
+  `path.basename(context.storageUri.fsPath)`, but `storageUri` is
+  `<…>/workspaceStorage/<hash>/<extensionId>` — the last segment is the
+  extension id, not the workspace hash. Every lookup therefore stored
+  `pvjagtap.copilot-usage-dashboard → <name>`, which matches no workspace
+  directory, so the fallback label survived. The hash is now taken from the
+  segment following `workspaceStorage`.
+
+## [1.10.98] - 2026-08-15
+
+### Fixed
+
+- **Chats started without a folder open were never counted.** VS Code writes
+  those to a flat `globalStorage/emptyWindowChatSessions` directory rather than
+  `workspaceStorage/<hash>/chatSessions`, and the scanner only ever walked the
+  latter. On a real profile that hid 24 of 28 session files (13.6 MB of 15.6 MB)
+  and truncated history from 2025-07-09 to 2026-02. `discoverEmptyWindowSessionFiles`
+  now adds the global store, derived as a sibling of the resolved
+  `workspaceStorage` root, and attributes it to the project `(no folder)`.
+  When the configured root points at the *target* of a relocated storage dir
+  the sibling does not exist, so discovery falls back to the standard root
+  that resolves to the same path. Unrelated roots — a test fixture, another
+  machine's export — match nothing and correctly get no global store.
+
+- **Pre-JSONL `.json` sessions were skipped.** Both discovery passes filtered on
+  `.jsonl`, dropping the older single-object format still present on disk
+  (including a 1.3 MB session). Those files hold exactly the payload that a
+  `kind=0` op carries, so they are now wrapped into one and fed through the
+  existing legacy parser path unchanged.
+
+- **Symlinked workspace directories could vanish silently.** `listWorkspaceDirsSorted`
+  filtered on `Dirent.isDirectory()`, which is `false` for symlinks and Windows
+  junctions, so a per-workspace link would have been skipped without error. It
+  now keeps symlink entries and lets the existing `stat`-based checks reject
+  anything that is not a directory. A symlinked `workspaceStorage` *root* was
+  never affected — `readdir` and `fsp.stat` both follow it.
+
 ## [1.10.97] - 2026-08-15
 
 ### Fixed

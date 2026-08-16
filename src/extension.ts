@@ -1,9 +1,10 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
+import * as path from "path";
 import { OTelReceiver } from "./otelReceiver";
 import { StatusBarProvider, CurrentSessionInfo } from "./statusBar";
 import { DashboardPanel } from "./dashboardPanel";
-import { scanWorkspaceStorage, ScanResult, getWorkspaceStoragePath } from "./scanner";
+import { scanWorkspaceStorage, ScanResult, getWorkspaceStoragePath, setProjectNameHints } from "./scanner";
 import { scanAgentSessions, AgentScanResult } from "./agentScanner";
 import { scanCliSessions, CliScanResult } from "./cliScanner";
 import { buildDashboardData, DashboardData, AIC_EFFECTIVE_DATE } from "./dashboardData";
@@ -163,6 +164,45 @@ function buildData(): DashboardData {
   return cachedDashData;
 }
 
+/**
+ * VS Code stopped writing `workspace.json` into the storage dir, so the scanner
+ * has no on-disk way to name a project. Record workspaceHash → folder name here
+ * and every project the user opens gets named, including retroactively for
+ * sessions already on disk.
+ */
+function rememberWorkspaceName(context: vscode.ExtensionContext): void {
+  const key = "workspaceNames";
+  const map = { ...(context.globalState.get<Record<string, string>>(key) ?? {}) };
+
+  const hash = workspaceHashFromStorageUri(context.storageUri?.fsPath);
+  const name = vscode.workspace.name;
+  if (hash && name && map[hash] !== name) {
+    map[hash] = name;
+    void context.globalState.update(key, map);
+  }
+
+  setProjectNameHints(map);
+}
+
+/**
+ * `storageUri` is `<...>/workspaceStorage/<hash>/<extensionId>`, so the hash is
+ * the segment after `workspaceStorage` — not the last one.
+ */
+export function workspaceHashFromStorageUri(storagePath: string | undefined): string {
+  if (!storagePath) {
+    return "";
+  }
+  const parts = storagePath.split(/[\\/]+/).filter(Boolean);
+  const i = parts.lastIndexOf("workspaceStorage");
+  if (i >= 0 && parts[i + 1]) {
+    return parts[i + 1];
+  }
+  // Unrecognised layout: the extension-id segment is the only thing we can
+  // reliably strip, and it always contains a dot.
+  const last = parts[parts.length - 1] ?? "";
+  return last.includes(".") ? parts[parts.length - 2] ?? "" : last;
+}
+
 async function runScan(): Promise<void> {
   try {
     const t0 = Date.now();
@@ -211,6 +251,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerSyncKeys(context);
   output = vscode.window.createOutputChannel("Copilot Usage");
   context.subscriptions.push(output);
+
+  rememberWorkspaceName(context);
 
   // Record activation time — used to scope "current" stats to this VS Code instance
   activationTime = new Date().toISOString();

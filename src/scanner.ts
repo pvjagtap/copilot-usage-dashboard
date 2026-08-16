@@ -962,13 +962,50 @@ async function readDirNames(p: string): Promise<string[]> {
   }
 }
 
+/** wsHash / project labels for sessions that belong to no workspace folder. */
+const EMPTY_WINDOW_HASH = "emptyWindowChatSessions";
+const EMPTY_WINDOW_PROJECT = "(no folder)";
+
+/** Sessions predating the JSONL delta log are a single `.json` object. */
+function isSessionFileName(name: string): boolean {
+  return name.endsWith(".jsonl") || name.endsWith(".json");
+}
+
+/**
+ * workspaceHash → folder name, learned at activation from `context.storageUri`.
+ * Current VS Code no longer writes `workspace.json` into the storage dir, so
+ * without this every project renders as the `workspace-<hash8>` fallback.
+ */
+let _projectNameHints: Record<string, string> = {};
+
+export function setProjectNameHints(hints: Record<string, string>): void {
+  _projectNameHints = hints;
+}
+
+/**
+ * Wrap a legacy `.json` session so the kind=0 branch of the JSONL parser can
+ * consume it — the object is exactly the `v` payload that kind=0 carries.
+ */
+function legacyJsonToKind0(raw: string): string {
+  try {
+    const v: unknown = JSON.parse(raw);
+    return isObj(v) ? JSON.stringify({ kind: 0, v }) : "";
+  } catch {
+    return "";
+  }
+}
+
 /**
  * List the immediate subdirectories of `wsRoot`, sorted by name.
  * Non-directory entries are filtered out; missing/inaccessible roots yield [].
  */
 async function listWorkspaceDirsSorted(wsRoot: string): Promise<fs.Dirent[]> {
   const entries = await readDirSafe(wsRoot);
-  return entries.filter(e => e.isDirectory()).sort((a, b) => a.name.localeCompare(b.name));
+  // Dirent.isDirectory() is false for symlinks and Windows junctions, so keep
+  // those too — callers stat the paths they build and drop non-directories.
+  return entries
+    .filter(e => e.isDirectory() || e.isSymbolicLink())
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Process a single workspace directory for session files. */
@@ -985,6 +1022,10 @@ async function processWorkspaceDirForSessions(
 
   // Resolve project name from workspace.json
   let projectName = `workspace-${dirName.slice(0, 8)}`;
+  const hint = _projectNameHints[dirName];
+  if (hint) {
+    projectName = hint;
+  }
   const workspaceJsonPath = path.join(wsDir, "workspace.json");
   try {
     const raw = await fsp.readFile(workspaceJsonPath, "utf-8");
@@ -1001,7 +1042,7 @@ async function processWorkspaceDirForSessions(
   }
 
   const names = await readDirNames(chatDir);
-  const jsonlFiles = names.filter(f => f.endsWith(".jsonl")).sort();
+  const jsonlFiles = names.filter(isSessionFileName).sort();
 
   return jsonlFiles.map(f => ({
     path: path.join(chatDir, f),
@@ -1019,6 +1060,69 @@ async function discoverSessionFiles(wsRoot: string): Promise<FileEntry[]> {
   });
 
   return results.flat();
+}
+
+/**
+ * Chats started in a window with no folder open are written to a flat global
+ * store instead of `<wsRoot>/<hash>/chatSessions`, so they need their own
+ * discovery pass or they never reach the dashboard.
+ */
+export function getEmptyWindowSessionsPath(wsRoot: string): string {
+  return path.join(path.dirname(wsRoot), "globalStorage", "emptyWindowChatSessions");
+}
+
+/** realpath, or the input unchanged when it cannot be resolved. */
+async function realpathSafe(p: string): Promise<string> {
+  try {
+    return await fsp.realpath(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * The global store normally sits beside `wsRoot`. When the configured root
+ * points at the *target* of a relocated/symlinked storage dir that sibling
+ * does not exist, so fall back to the standard root that resolves to the same
+ * place. Unrelated roots (test fixtures) match nothing and get no global store.
+ */
+async function resolveEmptyWindowDir(wsRoot: string): Promise<string> {
+  const sibling = getEmptyWindowSessionsPath(wsRoot);
+  if (await isDirectory(sibling)) {
+    return sibling;
+  }
+
+  const target = await realpathSafe(wsRoot);
+  for (const candidate of getWorkspaceStorageCandidates()) {
+    if (candidate === wsRoot) {
+      continue;
+    }
+    if ((await realpathSafe(candidate)) !== target) {
+      continue;
+    }
+    const viaCandidate = getEmptyWindowSessionsPath(candidate);
+    if (await isDirectory(viaCandidate)) {
+      return viaCandidate;
+    }
+  }
+  return "";
+}
+
+async function discoverEmptyWindowSessionFiles(wsRoot: string): Promise<FileEntry[]> {
+  const dir = await resolveEmptyWindowDir(wsRoot);
+  if (!dir) {
+    return [];
+  }
+
+  const names = await readDirNames(dir);
+  return names
+    .filter(isSessionFileName)
+    .sort()
+    .map(f => ({
+      path: path.join(dir, f),
+      wsHash: EMPTY_WINDOW_HASH,
+      project: EMPTY_WINDOW_PROJECT,
+    }));
 }
 
 /** Discover all transcript JSONL files. */
@@ -1484,11 +1588,13 @@ export async function scanWorkspaceStorage(workspaceStorageOverride?: string): P
   const wsRoot = await getWorkspaceStoragePath(workspaceStorageOverride);
 
   // Discover all file locations concurrently
-  const [sessionFiles, transcriptMap, debugLogMap] = await Promise.all([
+  const [wsSessionFiles, emptyWindowFiles, transcriptMap, debugLogMap] = await Promise.all([
     discoverSessionFiles(wsRoot),
+    discoverEmptyWindowSessionFiles(wsRoot),
     discoverTranscriptFiles(wsRoot),
     discoverDebugLogsCached(wsRoot),
   ]);
+  const sessionFiles = [...wsSessionFiles, ...emptyWindowFiles];
 
   // Parse session files concurrently with mtime caching
   const bundlesBySession = new Map<string, SessionBundle[]>();
@@ -1527,8 +1633,10 @@ export async function scanWorkspaceStorage(workspaceStorageOverride?: string): P
   // Read all cache-miss files concurrently
   await mapConcurrent(filesToRead, 16, async ({ idx, file }) => {
     try {
-      const content = await fsp.readFile(file.path, "utf-8");
-      const bundle = parseSessionContent(content, file.path, file.wsHash, file.project, path.basename(file.path, ".jsonl"));
+      const raw = await fsp.readFile(file.path, "utf-8");
+      const ext = path.extname(file.path);
+      const content = ext === ".json" ? legacyJsonToKind0(raw) : raw;
+      const bundle = parseSessionContent(content, file.path, file.wsHash, file.project, path.basename(file.path, ext));
       if (bundle) {
         _sessionBundleCache.set(file.path, { mtime: filesToProcess[idx].mtime, bundle });
       } else {
