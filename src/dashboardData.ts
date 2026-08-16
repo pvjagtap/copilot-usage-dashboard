@@ -218,6 +218,16 @@ export interface SessionView {
   transcriptPaths: string[];
   /** AI Credits consumed by this session (0 if before AIC effective date) */
   aicCredits: number;
+  /**
+   * Billable AIC credits split by the day each request actually ran, derived
+   * from the same `creditEntries` list that feeds `computeSummary`. Empty for
+   * pre-AIC sessions, which keep the rate-table estimate in `aicCredits`.
+   *
+   * Consumers MUST range-filter on this instead of pinning `aicCredits` to
+   * `lastDate` — a session that spans a month boundary otherwise reports its
+   * whole lifetime spend inside whichever month it last ran in.
+   */
+  aicByDay: Array<{ day: string; credits: number }>;
 }
 
 export interface DashboardData {
@@ -338,6 +348,15 @@ export interface AICDashboardData {
   }>;
   /** Per-day credit totals */
   byDay: Array<{ day: string; credits: number }>;
+  /**
+   * Billable credits per day that belong to no scanned VS Code chat session —
+   * live OTel requests not yet flushed to a debug log, plus OMP / Pi / CLI
+   * agent sessions. `byDay` = Σ SessionView.aicByDay + this, per day.
+   *
+   * The Usage-by-Model table renders these as their own rows so its TOTAL row
+   * reconciles exactly with the hero "AI Credits Spent" tile.
+   */
+  unattributedByDay: Array<{ day: string; credits: number }>;
   /** Current AIC configuration for display */
   config: AICConfig;
   /**
@@ -607,6 +626,7 @@ function computeSessionViews(sessions: Session[], toolCalls: ToolCall[], turns: 
       sourcePaths: s.sourcePaths || [],
       transcriptPaths: s.transcriptPaths || [],
       aicCredits: Math.round((sessionCreditsMap.get(s.sessionId) ?? 0) * 100) / 100,
+      aicByDay: [],
     };
   });
 }
@@ -1251,6 +1271,9 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
   // keeps non-billable (Ollama / BYOK / unknown) usage out of the headline
   // total while still letting the calculator surface it under
   // `summary.nonBillable` for an informational panel.
+  // `sessionId` / `source` are carried purely so the per-session AIC view can
+  // be rebuilt from this exact list — one credit basis for the hero, the
+  // Usage-by-Model table, the sidebar and the status bar.
   const creditEntries: Array<{
     model: string;
     inputTokens: number;
@@ -1259,6 +1282,8 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     date: string;
     actualCredits?: number;
     billable: boolean;
+    sessionId?: string;
+    source: "vscode" | "otel" | "omp" | "pi" | "cli";
   }> = [];
   const classify = (model: string, hasActual: boolean, sourceHint?: string): boolean =>
     classifyModelBillability(calculator, config, model, hasActual, classifyByCatalog, sourceHint);
@@ -1281,6 +1306,8 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           date,
           actualCredits: hasNano ? req.nanoAiu / 1_000_000_000 : undefined,
           billable: classify(req.model, hasNano, req.debugName),
+          sessionId: t.sessionId,
+          source: "vscode",
         });
       }
     } else if (t.timestamp && t.debugByModel) {
@@ -1295,6 +1322,8 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           date,
           actualCredits: hasNano ? mt.nanoAiu / 1_000_000_000 : undefined,
           billable: classify(model, hasNano),
+          sessionId: t.sessionId,
+          source: "vscode",
         });
       }
     } else if (t.timestamp) {
@@ -1310,6 +1339,8 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         // Actual AIC from API (if available) — overrides computed credits
         actualCredits: hasNano ? t.debugAicCredits : undefined,
         billable: classify(model, hasNano),
+        sessionId: t.sessionId,
+        source: "vscode",
       });
     }
   }
@@ -1336,6 +1367,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           date: todayStr,
           actualCredits: undefined,
           billable: classify(req.modelName, false),
+          source: "otel",
         });
       }
     } else {
@@ -1353,6 +1385,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           date: todayStr,
           actualCredits: undefined,
           billable: classify(m.model, false),
+          source: "otel",
         });
       }
     }
@@ -1388,7 +1421,9 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
       // store that field in USD, and agentScanner converts it to AIC credits.
       // Copilot-routed sessions without that field fall back to the token-rate
       // calculator; third-party sessions never do (see below).
-      for (const [model, stats] of Object.entries(session.modelBreakdown)) {
+      for (const [key, stats] of Object.entries(session.modelBreakdown)) {
+        // Rows are keyed provider+model; `stats.model` carries the bare name.
+        const model = stats.model ?? key;
         const provider = (stats.provider || session.provider || "").toLowerCase();
         const providerIsCopilot = provider.includes("github") || provider.includes("copilot");
         const providerIsThirdParty = provider.length > 0 && !providerIsCopilot;
@@ -1401,10 +1436,27 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         if (providerIsThirdParty) {
           actualCredits = stats.costCredits;
         } else {
-          const grossInput = stats.input + stats.cacheRead + stats.cacheWrite;
-          actualCredits = stats.costCredits > 0
-            ? stats.costCredits
-            : calculator.calculateCredits(model, grossInput, stats.output, stats.cacheRead, stats.cacheWrite).totalCredits;
+          // Agents write `usage.cost` on a minority of messages, and often on
+          // only SOME calls to a given model. Gating on `costCredits > 0` would
+          // price those calls and drop the rest — the same partial-coverage bug
+          // fixed for VS Code turns in 1.10.91. Price the recorded part from the
+          // ledger and rate-estimate exactly the calls it did not cover.
+          const u = stats.unpriced;
+          const estimateFrom = u
+            ? { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite }
+            : stats.costCredits > 0
+              ? null
+              : { input: stats.input, output: stats.output, cacheRead: stats.cacheRead, cacheWrite: stats.cacheWrite };
+          const estimate = estimateFrom
+            ? calculator.calculateCredits(
+                model,
+                estimateFrom.input + estimateFrom.cacheRead + estimateFrom.cacheWrite,
+                estimateFrom.output,
+                estimateFrom.cacheRead,
+                estimateFrom.cacheWrite
+              ).totalCredits
+            : 0;
+          actualCredits = stats.costCredits + estimate;
         }
         if (actualCredits <= 0) {
           continue;
@@ -1420,6 +1472,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           date,
           actualCredits,
           billable,
+          source: session.source === "omp" ? "omp" : "pi",
         });
         if (billable) {
           if (session.source === "omp") { ompCredits += actualCredits; }
@@ -1466,6 +1519,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           date,
           actualCredits: aic,
           billable,
+          source: "cli",
         });
         cliCreditEntryTotal += aic;
         if (billable) {
@@ -1484,6 +1538,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         date: fallbackDate,
         actualCredits: cliDelta,
         billable: true,
+        source: "cli",
       });
       cliCredits += cliDelta;
     }
@@ -1509,6 +1564,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           date: new Date().toISOString().slice(0, 10),
           actualCredits: fallbackAic,
           billable: true,
+          source: "cli",
         });
         cliCredits += fallbackAic;
       }
@@ -1516,6 +1572,44 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
   }
 
   const summary = calculator.computeSummary(creditEntries);
+
+  // ─── One credit basis for every surface ───────────────────────
+  // `creditEntries` is the list the headline total is computed from. Rebuild
+  // the per-session view from that same list so the hero tile, Usage-by-Model,
+  // the sidebar and the status bar can never disagree.
+  //
+  // Before this, `SessionView.aicCredits` was a second, independent pass over
+  // `scan.turns` that (a) collapsed a whole turn to `debugAicCredits` — losing
+  // the rate-estimated requests inside turns that only partially reported
+  // `copilotUsageNanoAiu`, (b) rate-estimated at the parent turn's model
+  // instead of per sub-model, and (c) applied no billable filter.
+  //
+  // Deliberately NOT clipped to the billing cycle (unlike `summary.byDay`) so
+  // historical month ranges resolve from the same numbers.
+  const sessionAicByDay = new Map<string, Map<string, number>>();
+  const unattributedByDay = new Map<string, number>();
+  for (const e of creditEntries) {
+    if (!e.billable || e.date === "unknown") { continue; }
+    const credits = e.actualCredits !== undefined && e.actualCredits > 0
+      ? e.actualCredits
+      : calculator.calculateCredits(e.model, e.inputTokens, e.outputTokens, e.cachedTokens).totalCredits;
+    if (credits <= 0) { continue; }
+    if (e.source === "vscode" && e.sessionId) {
+      let days = sessionAicByDay.get(e.sessionId);
+      if (!days) { days = new Map<string, number>(); sessionAicByDay.set(e.sessionId, days); }
+      days.set(e.date, (days.get(e.date) ?? 0) + credits);
+    } else {
+      unattributedByDay.set(e.date, (unattributedByDay.get(e.date) ?? 0) + credits);
+    }
+  }
+  for (const s of sessionsAll) {
+    const days = sessionAicByDay.get(s.sessionId);
+    if (!days) { continue; }
+    s.aicByDay = Array.from(days.entries())
+      .map(([day, credits]) => ({ day, credits }))
+      .sort((a, b) => a.day.localeCompare(b.day));
+    s.aicCredits = Math.round(s.aicByDay.reduce((sum, d) => sum + d.credits, 0) * 100) / 100;
+  }
 
   // Promo detection: auto-detect if we're in the June 1 – Sept 1, 2026 window
   const promoInfo = getPromoInfo(config.plan, summary.plan.monthlyCreditsIncluded);
@@ -1559,6 +1653,10 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     })).sort((a, b) => b.totalCredits - a.totalCredits),
     byDay: Array.from(summary.byDay.entries())
       .map(([day, credits]) => ({ day, credits: Math.round(credits * 100) / 100 }))
+      .sort((a, b) => a.day.localeCompare(b.day)),
+    unattributedByDay: Array.from(unattributedByDay.entries())
+      .map(([day, credits]) => ({ day, credits: Math.round(credits * 100) / 100 }))
+      .filter(d => d.credits > 0)
       .sort((a, b) => a.day.localeCompare(b.day)),
     config,
     nonBillable: {

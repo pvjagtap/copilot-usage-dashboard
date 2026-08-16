@@ -374,7 +374,8 @@ function parseSessionContent(
   content: string,
   filePath: string,
   wsHash: string,
-  projectName: string
+  projectName: string,
+  fileStem: string
 ): SessionBundle | null {
   const lines = content.split("\n").filter(l => l.trim());
   if (lines.length === 0) {
@@ -392,6 +393,13 @@ function parseSessionContent(
   let agentId = "";
   let promptCount = 0;
   let promptPreview = "";
+
+  // Current VS Code builds write no kind=0 header — the session id lives in the
+  // filename and the requests array is materialised purely from kind=1 (set at
+  // path) and kind=2 (append to array) ops. Replay them so the new shape can be
+  // read; `sawKind0` keeps legacy files on the original code path below.
+  let sawKind0 = false;
+  const replayRequests: unknown[] = [];
 
   const turns: Turn[] = [];
   const toolCalls: ToolCall[] = [];
@@ -412,8 +420,26 @@ function parseSessionContent(
     const k = entry.k;
     const v = entry.v;
 
+    // Replay capture for the current format. MUST run before the legacy
+    // branches below — several of them `continue`, which would skip these ops
+    // (notably `requests/N/result`, the only carrier of toolCallRounds).
+    if (isArr(k) && k[0] === "requests") {
+      if (kind === 2 && k.length === 1 && isArr(v)) {
+        replayRequests.push(...v);
+      } else if (kind === 1 && k.length === 3) {
+        const idx = typeof k[1] === "number" ? k[1] : parseInt(String(k[1]), 10);
+        if (Number.isInteger(idx) && idx >= 0) {
+          const existing = replayRequests[idx];
+          const target: Record<string, unknown> = isObj(existing) ? existing : {};
+          target[String(k[2])] = v;
+          replayRequests[idx] = target;
+        }
+      }
+    }
+
     // kind=0: session metadata
     if (kind === 0 && isObj(v)) {
+      sawKind0 = true;
       sessionId = typeof v.sessionId === "string" ? v.sessionId : "";
       if (typeof v.creationDate === "number") {
         firstTimestamp = epochMsToIso(v.creationDate);
@@ -577,6 +603,128 @@ function parseSessionContent(
         promptPreview = text;
       }
       continue;
+    }
+  }
+
+  // ── Current format: no kind=0 header ──────────────────────
+  // The legacy branches above only see `requests/N/result`, so they miss the
+  // separate promptTokens / completionTokens / copilotCredits ops entirely.
+  // Rebuild from the replayed array instead, which carries all of them.
+  if (!sawKind0 && replayRequests.length > 0) {
+    turns.length = 0;
+    toolCalls.length = 0;
+    subagents.length = 0;
+
+    for (let ri = 0; ri < replayRequests.length; ri++) {
+      const req = replayRequests[ri];
+      if (!isObj(req)) {
+        continue;
+      }
+      const meta = get(req, "result", "metadata");
+      const metaObj = isObj(meta) ? meta : {};
+
+      if (!sessionId && typeof metaObj.sessionId === "string") {
+        sessionId = metaObj.sessionId;
+      }
+      if (typeof metaObj.agentId === "string") {
+        agentId = metaObj.agentId;
+      }
+      const reqAgent = get(req, "agent", "id");
+      if (typeof reqAgent === "string") {
+        agentId = reqAgent;
+      }
+
+      // `copilot/claude-opus-5` → `claude-opus-5`.
+      const rawModel = typeof req.modelId === "string" ? req.modelId : "";
+      if (rawModel) {
+        const bare = rawModel.includes("/") ? rawModel.slice(rawModel.lastIndexOf("/") + 1) : rawModel;
+        modelName = bare;
+        modelFamily = bare;
+      }
+
+      const completedAt = num(isObj(req.modelState) ? req.modelState : {}, "completedAt");
+      const reqTs = num(req as Record<string, unknown>, "timestamp");
+      const respTs = num(req as Record<string, unknown>, "responseTimestamp");
+      const tsMs = completedAt || respTs || reqTs;
+      const timestamp = tsMs ? epochMsToIso(tsMs) : firstTimestamp;
+      if (!firstTimestamp && timestamp) {
+        firstTimestamp = timestamp;
+      }
+
+      const prompt = num(req as Record<string, unknown>, "promptTokens");
+      const completion = num(req as Record<string, unknown>, "completionTokens");
+      // Copilot's own per-request credit figure. Debug logs overwrite this
+      // later when they carry `copilotUsageNanoAiu` for the same turn.
+      const credits = num(req as Record<string, unknown>, "copilotCredits");
+
+      turns.push({
+        sessionId,
+        turnIndex: ri,
+        timestamp,
+        modelFamily,
+        promptTokens: prompt,
+        outputTokens: completion,
+        debugPromptTokens: 0,
+        debugOutputTokens: 0,
+        debugCachedTokens: 0,
+        debugLlmCalls: 0,
+        debugAicCredits: credits,
+        debugLastRequestAic: 0,
+        debugLastRequestTs: "",
+        toolCallRounds: isArr(metaObj.toolCallRounds) ? metaObj.toolCallRounds.length : 0,
+        toolCallResults: isArr(metaObj.toolCallResults) ? metaObj.toolCallResults.length : 0,
+        workspaceName: extractWorkspaceName(
+          typeof metaObj.cacheKey === "string" ? metaObj.cacheKey : undefined,
+          wsHash
+        ),
+      });
+
+      let callIndex = 0;
+      if (isArr(metaObj.toolCallRounds)) {
+        for (const round of metaObj.toolCallRounds) {
+          if (!isObj(round) || !isArr(round.toolCalls)) {
+            continue;
+          }
+          for (const tc of round.toolCalls) {
+            if (!isObj(tc)) {
+              continue;
+            }
+            const toolName = typeof tc.name === "string" ? tc.name : "unknown";
+            const isSub = toolName === "runSubagent";
+            toolCalls.push({ sessionId, turnIndex: ri, callIndex, toolName, isSubagent: isSub });
+            if (isSub) {
+              const { agentName, description } = extractSubagentArgs(tc.arguments);
+              subagents.push({ sessionId, turnIndex: ri, callIndex, agentName, description });
+            }
+            callIndex++;
+          }
+        }
+      }
+
+      if (ri === 0 && !promptPreview) {
+        const msg = (req as Record<string, unknown>).message;
+        if (isObj(msg) && typeof msg.text === "string" && msg.text.trim()) {
+          const text = msg.text.trim();
+          promptPreview = text.length > 180 ? text.slice(0, 177) + "..." : text;
+        }
+      }
+    }
+
+    if (promptCount === 0) {
+      promptCount = replayRequests.length;
+    }
+    // Session id now lives in the filename when no request carried metadata.
+    if (!sessionId) {
+      sessionId = fileStem;
+    }
+    for (const t of turns) {
+      t.sessionId = sessionId;
+    }
+    for (const tc of toolCalls) {
+      tc.sessionId = sessionId;
+    }
+    for (const sa of subagents) {
+      sa.sessionId = sessionId;
     }
   }
 
@@ -1380,7 +1528,7 @@ export async function scanWorkspaceStorage(workspaceStorageOverride?: string): P
   await mapConcurrent(filesToRead, 16, async ({ idx, file }) => {
     try {
       const content = await fsp.readFile(file.path, "utf-8");
-      const bundle = parseSessionContent(content, file.path, file.wsHash, file.project);
+      const bundle = parseSessionContent(content, file.path, file.wsHash, file.project, path.basename(file.path, ".jsonl"));
       if (bundle) {
         _sessionBundleCache.set(file.path, { mtime: filesToProcess[idx].mtime, bundle });
       } else {

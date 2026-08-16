@@ -408,6 +408,10 @@ function _saveState() { vscode.setState({ selectedRange, selectedRefresh, select
 // dropped every duplicate-day session in historical ranges — July hero
 // showed 38050, AIC section showed 98135 from the same data). aic.byDay is
 // clipped to the current billing cycle; sessions fill days outside it.
+//
+// The session fallback reads s.aicByDay (per-request event day) rather than
+// pinning s.aicCredits to s.lastDate — a session that ran across a month
+// boundary otherwise dumps its whole lifetime spend into the later month.
 function buildRangeDayMap(bounds, sessions, aic) {
   const map = {};
   (aic && aic.byDay || []).forEach(d => {
@@ -417,14 +421,33 @@ function buildRangeDayMap(bounds, sessions, aic) {
   });
   const sessionByDay = {};
   sessions.forEach(s => {
-    if (s.lastDate && s.aicCredits) {
-      sessionByDay[s.lastDate] = (sessionByDay[s.lastDate] || 0) + s.aicCredits;
-    }
+    sessionDayCredits(s).forEach(d => {
+      if ((!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end)) {
+        sessionByDay[d.day] = (sessionByDay[d.day] || 0) + d.credits;
+      }
+    });
   });
   Object.entries(sessionByDay).forEach(([day, credits]) => {
     if (!(day in map)) { map[day] = credits; }
   });
   return map;
+}
+
+// Per-day credits for one session. Post-AIC sessions carry an exact
+// per-request-day split; pre-AIC ones only have a whole-session rate
+// estimate, which stays pinned to lastDate.
+function sessionDayCredits(s) {
+  if (s.aicByDay && s.aicByDay.length) { return s.aicByDay; }
+  return s.lastDate && s.aicCredits ? [{ day: s.lastDate, credits: s.aicCredits }] : [];
+}
+
+// Credits this session spent inside the selected range (not its lifetime).
+function sessionCreditsInRange(s, bounds) {
+  let total = 0;
+  sessionDayCredits(s).forEach(d => {
+    if ((!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end)) { total += d.credits; }
+  });
+  return total;
 }
 
 function fmt(n) {
@@ -787,10 +810,10 @@ function render() {
   renderAgentSessions(DATA.agentSummary, bounds, sessions, rangeAicTotal);
   renderDaily(daily);
   renderModelPie(sessions);
-  renderProjectBar(sessions);
+  renderProjectBar(sessions, bounds);
   renderToolBar(tools);
-  renderSessions(sessions, subs);
-  renderModelTable(sessions);
+  renderSessions(sessions, subs, bounds);
+  renderModelTable(sessions, bounds, rangeAicTotal);
   renderSubagents(subs);
   renderHourly(turns);
 }
@@ -957,7 +980,7 @@ function renderAIC(aic, bounds, filteredSessions) {
   // aic.totalCredits only covers the current billing cycle, so it cannot
   // gate historical ranges — a closed month with session credits must still
   // render even when the live cycle is empty.
-  const hasRangeCredits = filteredSessions.some(s => s.aicCredits > 0);
+  const hasRangeCredits = filteredSessions.some(s => sessionCreditsInRange(s, bounds) > 0);
   if (!aic || (aic.totalCredits === 0 && !hasRangeCredits)) {
     el.innerHTML = '<div class="table-card"><div class="section-head"><div class="section-title">AI Credits (AIC)</div><div class="section-subtitle">No usage data yet</div></div><div class="empty-panel">AI Credits will be calculated once token usage data is available. Configure your plan in Settings → Copilot Usage.</div></div>';
     return;
@@ -1060,7 +1083,7 @@ function renderAIC(aic, bounds, filteredSessions) {
   // columns render em-dash rather than a misleading 0.00.
   const coversCycle = !bounds.start || (bounds.start <= aic.billingCycleStart && (!bounds.end || bounds.end >= aic.billingCycleEnd));
   const hasCreditsOutsideCycle = filteredSessions.some(s =>
-    s.aicCredits > 0 && s.lastDate && (s.lastDate < aic.billingCycleStart || s.lastDate > aic.billingCycleEnd));
+    sessionDayCredits(s).some(d => d.credits > 0 && (d.day < aic.billingCycleStart || d.day > aic.billingCycleEnd)));
   const useOriginalByModel = coversCycle && !hasCreditsOutsideCycle;
   let modelRows = '';
   if (useOriginalByModel) {
@@ -1081,7 +1104,7 @@ function renderAIC(aic, bounds, filteredSessions) {
     filteredSessions.forEach(s => {
       const m = s.model || s.modelName || 'unknown';
       const row = modelData[m] || (modelData[m] = {total:0, tokensIn:0, tokensOut:0, tokensCached:0});
-      row.total += (s.aicCredits || 0);
+      row.total += sessionCreditsInRange(s, bounds);
       row.tokensIn += (s.actualPrompt || s.prompt || 0);
       row.tokensOut += (s.actualOutput || s.output || 0);
       row.tokensCached += (s.actualCached || 0);
@@ -1326,7 +1349,7 @@ function renderAgentSessions(agent, bounds, filteredSessions, rangeAicTotal) {
   const isCycleAlignedRange = selectedRange === 'tm' || selectedRange === 'all' || (!bounds.start && !bounds.end);
   const vscodeAicCredits = isCycleAlignedRange && typeof rangeAicTotal === 'number'
     ? Math.max(0, rangeAicTotal - (agent.ompTotalCredits||0) - (agent.piTotalCredits||0) - cliDisplayCredits)
-    : filteredSessions.reduce((s,x) => s + (x.aicCredits||0), 0);
+    : filteredSessions.reduce((s,x) => s + sessionCreditsInRange(x, bounds), 0);
   const hasAgentData = agent.ompSessions > 0 || agent.piSessions > 0 || agent.cliSessions > 0;
   const agentNote = hasAgentData
     ? ''
@@ -1507,13 +1530,13 @@ function renderModelPie(sessions) {
   });
 }
 
-function renderProjectBar(sessions) {
+function renderProjectBar(sessions, bounds) {
   dc('project');
   const pm={},om={},cm={};
   sessions.forEach(s=>{
     pm[s.project]=(pm[s.project]||0)+(s.actualPrompt||s.prompt);
     om[s.project]=(om[s.project]||0)+(s.actualOutput||s.output);
-    cm[s.project]=(cm[s.project]||0)+(s.aicCredits||0);
+    cm[s.project]=(cm[s.project]||0)+sessionCreditsInRange(s,bounds);
   });
   const rate = (DATA.aicSummary && DATA.aicSummary.config && DATA.aicSummary.config.overageCostPerCredit) || 0.01;
   const sorted=Object.entries(pm).map(([k,v])=>[k,v+(om[k]||0)]).sort((a,b)=>b[1]-a[1]);
@@ -1610,7 +1633,7 @@ function renderToolBar(tools) {
   });
 }
 
-function renderSessions(sessions, subs) {
+function renderSessions(sessions, subs, bounds) {
   const el = document.getElementById('sessions-section');
   if (!sessions.length) { el.innerHTML=''; return; }
   const rate = (DATA.aicSummary && DATA.aicSummary.config && DATA.aicSummary.config.overageCostPerCredit) || 0.01;
@@ -1635,8 +1658,11 @@ function renderSessions(sessions, subs) {
     // Cache % is pre-computed in dashboardData.ts (see cache.ts). Webview
     // never inlines the arithmetic — one source of truth for the formula.
     const cacheCell=s.actualPrompt>0?'<td class="num cached">'+(s.cacheHitPct||0).toFixed(1)+'%</td>':'<td class="num">—</td>';
-    const costCell=s.aicCredits?'<td class="num orange">$'+(s.aicCredits*rate).toFixed(2)+'</td>':'<td class="num">—</td>';
-    rows+='<tr><td style="font-family:monospace;font-size:11px">'+esc(s.sessionShort)+'...</td><td>'+esc(s.project)+'</td><td>'+sum+'</td><td style="font-size:11px">'+esc(s.last)+'</td><td class="num">'+s.durationMin+'m</td><td><span class="model-tag '+mc(s.modelName)+'">'+esc(s.modelName)+'</span>'+mbadge(mult)+'</td><td class="num">'+s.turns+'</td><td class="num">'+fmt(s.actualPrompt||s.prompt)+'</td><td class="num">'+fmt(s.actualOutput||s.output)+'</td>'+cacheCell+'<td class="num">'+fmt(s.toolCalls)+'</td><td class="num">'+(s.subagents||'')+(sd?' '+sd:'')+'</td><td class="num">'+(s.aicCredits?s.aicCredits.toFixed(1):'—')+'</td>'+costCell+'<td>'+flDiv+'</td></tr>';
+    // Range-scoped, same basis as Usage-by-Model — so this column sums to the
+    // hero tile rather than to the session's whole lifetime.
+    const sc=sessionCreditsInRange(s,bounds);
+    const costCell=sc?'<td class="num orange">$'+(sc*rate).toFixed(2)+'</td>':'<td class="num">—</td>';
+    rows+='<tr><td style="font-family:monospace;font-size:11px">'+esc(s.sessionShort)+'...</td><td>'+esc(s.project)+'</td><td>'+sum+'</td><td style="font-size:11px">'+esc(s.last)+'</td><td class="num">'+s.durationMin+'m</td><td><span class="model-tag '+mc(s.modelName)+'">'+esc(s.modelName)+'</span>'+mbadge(mult)+'</td><td class="num">'+s.turns+'</td><td class="num">'+fmt(s.actualPrompt||s.prompt)+'</td><td class="num">'+fmt(s.actualOutput||s.output)+'</td>'+cacheCell+'<td class="num">'+fmt(s.toolCalls)+'</td><td class="num">'+(s.subagents||'')+(sd?' '+sd:'')+'</td><td class="num">'+(sc?sc.toFixed(1):'—')+'</td>'+costCell+'<td>'+flDiv+'</td></tr>';
   });
   el.innerHTML='<div class="table-card"><div class="section-title">All Sessions &mdash; '+sessions.length+' shown</div><div class="sessions-scroll table-scroll"><table><thead><tr><th>Session</th><th>Project</th><th>Summary</th><th>Last Active</th><th class="num">Duration</th><th>Model</th><th class="num">Turns</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Cache %</th><th class="num">Tools</th><th class="num">Subagents</th><th class="num">AI Credits</th><th class="num">Cost</th><th>Files</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
   el.querySelectorAll('.file-link[data-path]').forEach(link => {
@@ -1644,19 +1670,17 @@ function renderSessions(sessions, subs) {
   });
 }
 
-function renderModelTable(sessions) {
+function renderModelTable(sessions, bounds, rangeAicTotal) {
   const el=document.getElementById('model-section');
   const m={};
   sessions.forEach(s=>{
     const k=s.modelName;
-    // Aggregate per session-primary-model. AI Credits are summed from each
-    // session's aicCredits (which already includes all sub-model calls made
-    // during that session — title-gen, subagents, model-change turns).
-    // Previously this joined against aicSummary.byModel which keys on the
-    // API-called model, not session-primary-model — that mismatch caused the
-    // ~83-credit visible drift (opus-4.6 row showed 15,072 but the session
-    // total was 15,155 because ~83 credits were from other models used
-    // inside opus-4.6 sessions).
+    // Aggregate per session-primary-model. Credits come from the session's
+    // per-request-day split (sessionCreditsInRange) so a session that straddles
+    // a range boundary only contributes the part it actually spent inside it.
+    // That split is derived from the same creditEntries list the hero total is
+    // computed from (dashboardData.ts), so the TOTAL row below reconciles by
+    // construction instead of by coincidence.
     if(!m[k]){m[k]={model:k,mult:getMult(k,s.multiplier),sessions:new Set(),turns:0,prompt:0,output:0,tools:0,subs:0,credits:0};}else{const sm=getMult(k,s.multiplier);if(sm>m[k].mult)m[k].mult=sm;}
     m[k].sessions.add(s.sessionId);
     m[k].turns+=s.turns;
@@ -1664,7 +1688,7 @@ function renderModelTable(sessions) {
     m[k].output+=(s.actualOutput||s.output);
     m[k].tools+=s.toolCalls;
     m[k].subs+=s.subagents;
-    m[k].credits+=(s.aicCredits||0);
+    m[k].credits+=sessionCreditsInRange(s,bounds);
   });
   const sorted=Object.values(m).sort((a,b)=>b.credits-a.credits || (b.prompt+b.output)-(a.prompt+a.output));
   let rows='';
@@ -1676,9 +1700,18 @@ function renderModelTable(sessions) {
     totals.turns+=m.turns; totals.prompt+=m.prompt; totals.output+=m.output;
     totals.tools+=m.tools; totals.subs+=m.subs; totals.credits+=m.credits;
   });
+  // Credits billed in this range that belong to no scanned chat session:
+  // in-flight OTel requests not yet written to a debug log, plus OMP / Pi /
+  // CLI agent usage. They are part of the hero total, so they get their own
+  // row rather than being silently dropped.
+  const other = typeof rangeAicTotal === 'number' ? rangeAicTotal - totals.credits : 0;
+  if (Math.abs(other) >= 0.01) {
+    rows+='<tr><td><span class="model-tag model-default" title="Live in-flight requests and OMP / Pi / CLI agent sessions — billed to the same budget but not tied to a VS Code chat session">Other sources &amp; live</span></td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num orange">'+other.toFixed(2)+'</td></tr>';
+    totals.credits += other;
+  }
   // Authoritative TOTAL row — its Credits MUST equal the hero "AI Credits Spent"
-  // (both are Σ session.aicCredits over the filtered range). If they diverge,
-  // a bug has been introduced upstream.
+  // (both are Σ of the same per-day credit map over the filtered range). If they
+  // diverge, a bug has been introduced upstream.
   if (sorted.length > 0) {
     rows+='<tr style="border-top:2px solid var(--border);font-weight:600;background:rgba(255,255,255,0.02)"><td>TOTAL</td><td class="num">—</td><td class="num">'+totals.sessions.size+'</td><td class="num">'+totals.turns+'</td><td class="num">'+fmt(totals.prompt)+'</td><td class="num">'+fmt(totals.output)+'</td><td class="num">'+fmt(totals.tools)+'</td><td class="num">'+totals.subs+'</td><td class="num orange">'+totals.credits.toFixed(2)+'</td></tr>';
   }

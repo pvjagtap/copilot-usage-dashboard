@@ -21,6 +21,67 @@
 </style>
 </head>
 <body>
+<h2 id="v11091">v1.10.91 — Usage-by-Model vs hero drift (Aug 15, 2026)</h2>
+
+<p><strong>Symptom:</strong> the Usage-by-Model TOTAL row showed <code>102,462.90</code> while the hero
+"AI Credits Spent" tile, the AIC card and Usage-by-Source all showed <code>98,450.30</code>.</p>
+
+<h3>Design decision — one credit basis, not two</h3>
+<p>
+The extension had two independent credit computations reading the same scan:
+<code>creditEntries</code> (per <code>llm_request</code>, feeding <code>computeSummary</code> → the hero) and
+<code>sessionCreditsMap</code> in <code>computeSessionViews</code> (per <em>turn</em>, feeding the tables).
+The second one diverged in four ways: it collapsed a turn to <code>debugAicCredits</code> whenever that was
+non-zero (dropping rate-estimated requests inside partially-reported turns), rate-estimated at the parent
+turn's model rather than per sub-model, applied no billable filter, and pinned the whole session lifetime
+to <code>session.lastDate</code>.
+</p>
+<p>
+Rather than patch the four symptoms, <code>SessionView.aicCredits</code> is now <em>derived from</em>
+<code>creditEntries</code> after <code>computeSummary</code> runs. Reconciliation is structural, not
+arithmetic — there is no second formula left that can drift.
+</p>
+
+<h3>Deviation — <code>aicByDay</code> is not cycle-clipped</h3>
+<p>
+<code>summary.byDay</code> drops anything outside the current billing cycle (correct: it answers "what will
+GitHub bill me this cycle"). <code>SessionView.aicByDay</code> deliberately keeps every AIC-era day, because
+the dashboard's historical month ranges are rendered from session data — clipping it would zero out July,
+June, etc. exactly as the pre-existing note in <code>computeSessionViews</code> warns.
+</p>
+
+<h3>Tradeoff — the "Other sources &amp; live" row</h3>
+<p>
+The hero includes billable credits with no owning chat session: in-flight OTel requests not yet flushed to a
+debug log, and OMP / Pi / CLI agent sessions. Options considered:
+</p>
+<table>
+<tr><th>Option</th><th>Verdict</th></tr>
+<tr><td>Subtract agent credits from the hero so the table matches</td><td>Rejected — the hero must equal what GitHub bills, which includes agent usage.</td></tr>
+<tr><td>Relabel the TOTAL row "VS Code sessions only"</td><td>Rejected — leaves the user doing arithmetic across three cards to check one number.</td></tr>
+<tr><td>Render the remainder as its own row <span class="ok">(chosen)</span></td><td>TOTAL equals the hero exactly; the remainder is visible and labelled instead of hidden.</td></tr>
+</table>
+<p>
+Its value is computed as <code>rangeAicTotal &minus; &Sigma; model rows</code> rather than from
+<code>unattributedByDay</code> directly. That makes it absorb any residual by construction, so the TOTAL row
+cannot silently disagree with the hero again — including credits from sessions whose <code>lastDate</code>
+falls outside the selected range.
+</p>
+
+<h3>Open questions</h3>
+<ul>
+<li>The dashboard's session filter (<code>DATA.sessionsAll.filter(... s.lastDate ...)</code>) still selects
+sessions by <code>lastDate</code>. A session that ran in August but last spoke in September is excluded from
+the August table entirely; its August credits land in "Other sources &amp; live". Should the filter switch to
+"has credits in range"? That would change session counts and token totals across every chart, so it was left
+alone — confirm whether you want that too.</li>
+<li><code>verify-no-drift.js</code>, <code>verify-dashboard-vs-api.js</code> and
+<code>verify-live-aic-reconciliation.js</code> fail identically before and after this change (the last one is
+a missing <code>vscode</code> stub in the harness). Pre-existing failures, not regressions.</li>
+</ul>
+
+<hr>
+
 <h1>Issue #5 — Usage statistics don't match actual numbers from GitHub</h1>
 
 <p><strong>Report:</strong>

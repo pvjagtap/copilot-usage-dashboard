@@ -42,6 +42,21 @@ export interface AgentModelTokens {
   llmCalls: number;
   /** Provider observed for this model (for example github-copilot, anthropic, ollama). */
   provider: string;
+  /** Model name. Present because rows are keyed by provider + model, not model alone. */
+  model?: string;
+  /**
+   * Tokens from calls that recorded NO `usage.cost.total`. `costCredits` prices
+   * only the calls that did, so a caller that stops at `costCredits > 0` silently
+   * drops these. Agents populate `cost` on a minority of messages (12.8% across
+   * the observed history), so this is the common case, not the edge case.
+   */
+  unpriced?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    calls: number;
+  };
 }
 
 export interface AgentSessionData {
@@ -206,29 +221,39 @@ function parseAgentSession(
     totalPremium += pr;
     llmCalls++;
 
-    // Per-model token accumulation
+    // Per-model token accumulation, keyed by provider + model. Keying by model
+    // alone latched whichever provider was seen first, so the same model served
+    // by two providers in one session (claude-opus-5 runs on both Copilot and
+    // Azure Foundry) would bill entirely to one of them.
     const callModel = typeof msg["model"] === "string" ? msg["model"] : primaryModel || "unknown";
-    const existing = modelMap.get(callModel);
-    if (existing) {
-      existing.input += inp;
-      existing.output += out;
-      existing.cacheRead += cr;
-      existing.cacheWrite += cw;
-      existing.costCredits += cost;
-      existing.llmCalls++;
-      if (!existing.provider && callProvider) {
-        existing.provider = callProvider;
-      }
-    } else {
-      modelMap.set(callModel, {
-        input: inp,
-        output: out,
-        cacheRead: cr,
-        cacheWrite: cw,
-        costCredits: cost,
-        llmCalls: 1,
+    const modelKey = `${callProvider || ""}::${callModel}`;
+    let row = modelMap.get(modelKey);
+    if (!row) {
+      row = {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        costCredits: 0,
+        llmCalls: 0,
         provider: callProvider || "",
-      });
+        model: callModel,
+        unpriced: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 },
+      };
+      modelMap.set(modelKey, row);
+    }
+    row.input += inp;
+    row.output += out;
+    row.cacheRead += cr;
+    row.cacheWrite += cw;
+    row.costCredits += cost;
+    row.llmCalls++;
+    if (cost <= 0 && row.unpriced) {
+      row.unpriced.input += inp;
+      row.unpriced.output += out;
+      row.unpriced.cacheRead += cr;
+      row.unpriced.cacheWrite += cw;
+      row.unpriced.calls++;
     }
 
     if (!primaryModel && typeof msg["model"] === "string") {
@@ -259,11 +284,19 @@ function parseAgentSession(
     return null;
   }
 
-  // Primary model = most LLM calls (deterministic tiebreak by name)
+  // Primary model = most LLM calls (deterministic tiebreak by name).
+  // Rows are keyed by provider+model, so aggregate back to the bare model name
+  // first — otherwise one model split across two providers loses to a model
+  // that only ever ran on one.
+  const callsByModel = new Map<string, number>();
+  for (const stats of modelMap.values()) {
+    const name = stats.model ?? "unknown";
+    callsByModel.set(name, (callsByModel.get(name) ?? 0) + stats.llmCalls);
+  }
   let maxCalls = 0;
-  for (const [m, stats] of modelMap) {
-    if (stats.llmCalls > maxCalls || (stats.llmCalls === maxCalls && m < primaryModel)) {
-      maxCalls = stats.llmCalls;
+  for (const [m, calls] of callsByModel) {
+    if (calls > maxCalls || (calls === maxCalls && m < primaryModel)) {
+      maxCalls = calls;
       primaryModel = m;
     }
   }
@@ -296,10 +329,39 @@ async function scanDirectory(
   sessionsRoot: string,
   source: AgentSource
 ): Promise<AgentSessionData[]> {
-  const projectDirs = await readdirSafe(sessionsRoot);
+  const entries = await readdirSafe(sessionsRoot);
   const allSessions: AgentSessionData[] = [];
 
-  const projectResults = await mapConcurrent(projectDirs, 8, async projDir => {
+  const readSession = async (filePath: string): Promise<AgentSessionData | null> => {
+    try {
+      const fstat = await fsp.stat(filePath);
+      if (!fstat.isFile()) {
+        return null;
+      }
+
+      const cached = fileCache.get(filePath);
+      if (cached && cached.mtime === fstat.mtimeMs) {
+        return cached.data;
+      }
+
+      const content = await fsp.readFile(filePath, "utf-8");
+      const data = parseAgentSession(content, filePath, source);
+      if (data) {
+        fileCache.set(filePath, { mtime: fstat.mtimeMs, data });
+      }
+      return data;
+    } catch {
+      return null;
+    }
+  };
+
+  // Sessions normally live in <root>/<project>/*.jsonl, but the agents also
+  // write straight into <root> when a session has no project context. Those
+  // loose files used to be dropped entirely (the walk only descended into
+  // directory entries), silently under-reporting agent credits.
+  const rootFiles = entries.filter(f => f.endsWith(".jsonl"));
+
+  const projectResults = await mapConcurrent(entries, 8, async projDir => {
     const projPath = path.join(sessionsRoot, projDir);
     const projStat = await fsp.stat(projPath).catch(() => null);
     if (!projStat?.isDirectory()) {
@@ -309,35 +371,24 @@ async function scanDirectory(
     const files = await readdirSafe(projPath);
     const jsonlFiles = files.filter(f => f.endsWith(".jsonl"));
 
-    const sessions = await mapConcurrent(jsonlFiles, 8, async file => {
-      const filePath = path.join(projPath, file);
-      try {
-        const fstat = await fsp.stat(filePath);
-        if (!fstat.isFile()) {
-          return null;
-        }
-
-        const cached = fileCache.get(filePath);
-        if (cached && cached.mtime === fstat.mtimeMs) {
-          return cached.data;
-        }
-
-        const content = await fsp.readFile(filePath, "utf-8");
-        const data = parseAgentSession(content, filePath, source);
-        if (data) {
-          fileCache.set(filePath, { mtime: fstat.mtimeMs, data });
-        }
-        return data;
-      } catch {
-        return null;
-      }
-    });
+    const sessions = await mapConcurrent(jsonlFiles, 8, file =>
+      readSession(path.join(projPath, file))
+    );
 
     return sessions.filter((s): s is AgentSessionData => s !== null);
   });
 
+  const rootSessions = await mapConcurrent(rootFiles, 8, file =>
+    readSession(path.join(sessionsRoot, file))
+  );
+
   for (const sessions of projectResults) {
     allSessions.push(...sessions);
+  }
+  for (const s of rootSessions) {
+    if (s) {
+      allSessions.push(s);
+    }
   }
   return allSessions;
 }

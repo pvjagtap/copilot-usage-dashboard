@@ -360,16 +360,21 @@ export function buildSidebarSnapshot(input: SidebarBuildInput): SidebarSnapshot 
   // Active session = the one matching currentSessionModel + most recent activity
   // since activationTime. Best-effort match — sidebar just shows a glyph.
   const activeShort = pickActiveSessionShort(dashData.sessionsAll, activationTime);
-  const sessionsSorted = [...dashData.sessionsAll]
-    .filter(s => s.aicCredits > 0 && !!s.lastDate && s.lastDate >= cycleStart && s.lastDate <= cycleEnd)
-    .sort((a, b) => b.aicCredits - a.aicCredits);
-  const rows: SidebarSessionRow[] = sessionsSorted.slice(0, 30).map(s => ({
+  // Credits are clipped to the cycle via the session's per-request-day split,
+  // not by testing lastDate — otherwise a session that started in the previous
+  // cycle contributes its whole lifetime spend here while the headline total
+  // counts only the in-cycle part.
+  const sessionsSorted = dashData.sessionsAll
+    .map(s => ({ s, credits: creditsInCycle(s, cycleStart, cycleEnd) }))
+    .filter(e => e.credits > 0)
+    .sort((a, b) => b.credits - a.credits);
+  const rows: SidebarSessionRow[] = sessionsSorted.slice(0, 30).map(({ s, credits }) => ({
     sessionId: s.sessionId,
     sessionShort: s.sessionShort,
     date: s.lastDate || s.last.slice(0, 10),
     source: classifySource(s),
     title: s.title || s.project || s.sessionShort,
-    credits: s.aicCredits,
+    credits: Math.round(credits * 100) / 100,
     active: s.sessionShort === activeShort,
   }));
 
@@ -390,8 +395,19 @@ export function buildSidebarSnapshot(input: SidebarBuildInput): SidebarSnapshot 
   };
 }
 
-function classifySource(s: SessionView): string {
-  // Match exact tokens, not substrings. `agentId` for VS Code chatSessions
+/**
+ * Credits this session spent inside `[start, end]`, using the per-request-day
+ * split built in dashboardData.ts. Pre-AIC sessions have no split, so their
+ * whole rate-estimated total stays pinned to `lastDate`.
+ */
+function creditsInCycle(s: SessionView, start: string, end: string): number {
+  if (s.aicByDay && s.aicByDay.length > 0) {
+    return s.aicByDay.reduce((sum, d) => (d.day >= start && d.day <= end ? sum + d.credits : sum), 0);
+  }
+  return s.lastDate && s.lastDate >= start && s.lastDate <= end ? s.aicCredits : 0;
+}
+
+function classifySource(s: SessionView): string {  // Match exact tokens, not substrings. `agentId` for VS Code chatSessions
   // is typically `"copilot"` / `"github.copilot-chat"` / `"copilot/workspaceAgent"`,
   // all of which contain the substring "pi" (positions 2–3 of "copilot") —
   // a naive `includes("pi")` would mislabel every Chat row as Pi.

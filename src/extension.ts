@@ -215,6 +215,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Record activation time — used to scope "current" stats to this VS Code instance
   activationTime = new Date().toISOString();
 
+  // ── Sidebar (Activity Bar) ─────────────────────────────────
+  // Registered BEFORE any await. `activate` goes on to await a full
+  // workspaceStorage scan, the OTel receiver bind and several global
+  // `config.update` writes; while those are pending VS Code has no provider
+  // for `copilotUsage.panel` and renders the view permanently blank — and if
+  // any of them rejects, registration never runs at all. The provider needs
+  // no scan data: it serves static HTML and asks for a snapshot via its
+  // `ready` ping, which `pushSidebarSnapshot` answers safely at any time.
+  sidebarProvider = new SidebarViewProvider(context.extensionUri);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(SidebarViewProvider.viewType, sidebarProvider, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
+    vscode.commands.registerCommand("copilotUsage.sidebar.refresh", async () => {
+      // Use the serialized wrapper so a manual refresh racing with the
+      // debug-log watcher never triggers two concurrent scans (they would
+      // race on the mtime cache). runScanSerialized() also handles
+      // updateStatusBar + DashboardPanel.updateIfVisible internally.
+      await runScanSerialized();
+    }),
+    vscode.commands.registerCommand("copilotUsage.sidebar.openDashboard", () => {
+      DashboardPanel.show(context.extensionUri, buildData());
+    })
+  );
+  // Session click → open the full dashboard. The dashboard does not yet
+  // support deep-linking to a specific session, so the `sessionId` payload
+  // is accepted but unused (logged for traceability). When per-session
+  // focus lands in DashboardPanel.show, wire it through here.
+  sidebarProvider.setOnSessionOpen((sessionId: string) => {
+    if (sessionId) {
+      output.appendLine(`Sidebar session click → opening dashboard (sessionId=${sessionId})`);
+    }
+    DashboardPanel.show(context.extensionUri, buildData());
+  });
+  // First open (or re-show) → push a fresh snapshot immediately so the user
+  // never sees stale "Waiting…" placeholders when scan/OTel data already exists.
+  sidebarProvider.setOnReady(() => {
+    pushSidebarSnapshot();
+  });
+
   // Auto-detect the user's Copilot plan via their existing GitHub session
   // (silent — no extra sign-in). Falls back to a one-time picker if the
   // session is missing or the SKU is unrecognised. Fire-and-forget so we
@@ -302,8 +342,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // returns so the dashboard, status bar, and any "openDashboard" command
   // see populated data on cold start. v1.9.14 tried to make this fire-
   // and-forget and shipped a dashboard that rendered all zeros until the
-  // scan completed — unacceptable. The file watcher takes over for live
-  // updates after this initial scan.
+  // scan completed — unacceptable. 1.10.95 repeated that mistake and was
+  // reverted. The file watcher takes over for live updates after this
+  // initial scan.
+  //
+  // The sidebar provider is registered above, before this await, so the view
+  // is wired as early as possible — but note VS Code will not dispatch
+  // resolveWebviewView until activate() itself resolves. If this scan is ever
+  // slow again, fix the scan, not the ordering.
   await runScan();
 
   // Start OTel receiver
@@ -387,39 +433,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Status bar
   statusBar = new StatusBarProvider("copilotUsage.openDashboard");
   context.subscriptions.push({ dispose: () => statusBar?.dispose() });
-
-  // ── Sidebar (Activity Bar) ─────────────────────────────────
-  sidebarProvider = new SidebarViewProvider(context.extensionUri);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(SidebarViewProvider.viewType, sidebarProvider, {
-      webviewOptions: { retainContextWhenHidden: true },
-    }),
-    vscode.commands.registerCommand("copilotUsage.sidebar.refresh", async () => {
-      // Use the serialized wrapper so a manual refresh racing with the
-      // debug-log watcher never triggers two concurrent scans (they would
-      // race on the mtime cache). runScanSerialized() also handles
-      // updateStatusBar + DashboardPanel.updateIfVisible internally.
-      await runScanSerialized();
-    }),
-    vscode.commands.registerCommand("copilotUsage.sidebar.openDashboard", () => {
-      DashboardPanel.show(context.extensionUri, buildData());
-    })
-  );
-  // Session click → open the full dashboard. The dashboard does not yet
-  // support deep-linking to a specific session, so the `sessionId` payload
-  // is accepted but unused (logged for traceability). When per-session
-  // focus lands in DashboardPanel.show, wire it through here.
-  sidebarProvider.setOnSessionOpen((sessionId: string) => {
-    if (sessionId) {
-      output.appendLine(`Sidebar session click → opening dashboard (sessionId=${sessionId})`);
-    }
-    DashboardPanel.show(context.extensionUri, buildData());
-  });
-  // First open (or re-show) → push a fresh snapshot immediately so the user
-  // never sees stale "Waiting…" placeholders when scan/OTel data already exists.
-  sidebarProvider.setOnReady(() => {
-    pushSidebarSnapshot();
-  });
 
   // ── Daily limit subsystem ──────────────────────────────────
   limitTracker = new DailyLimitTracker(context);

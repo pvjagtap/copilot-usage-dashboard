@@ -5,6 +5,247 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.97] - 2026-08-15
+
+### Fixed
+
+- **Every VS Code chat session was being discarded — the dashboard reported 0
+  sessions, 0 turns and 0 tokens while Copilot was actively in use.** VS Code
+  changed the `chatSessions` JSONL layout. It previously wrote a `kind=0`
+  header carrying `sessionId` plus an embedded `v.requests[]`; it now writes a
+  header-less delta log where `kind=1` sets a value at a path
+  (`["requests", 9, "promptTokens"]`) and `kind=2` appends to an array, with the
+  session id present only in the filename.
+
+  `parseSessionContent` read `sessionId` exclusively from the `kind=0` op and
+  bailed with `return null` when it was empty, so every current-format file was
+  dropped. The file was found and read — `sourceFiles: 1` — but produced
+  `canonicalSessions: 0`, which is why the failure was invisible: no error, just
+  an empty dashboard with all usage appearing to come from Pi.
+
+  The parser now replays the ops into a requests array and derives:
+  - session id from `result.metadata.sessionId`, falling back to the filename
+  - model from `modelId` (`copilot/claude-opus-5` → `claude-opus-5`)
+  - `promptTokens`, `completionTokens` and `copilotCredits` per request
+  - timestamps from `modelState.completedAt` / `responseTimestamp` / `timestamp`
+  - tool calls and subagents from `result.metadata.toolCallRounds`
+
+  Replay capture runs before the legacy branches, which `continue` past several
+  of these ops — `requests/N/result` is the only carrier of `toolCallRounds`,
+  and capturing it after those branches silently yielded 0 tool calls.
+
+  On the reporting profile this restores 1 session / 18 turns / 46 tool calls /
+  1,712.38 credits where the dashboard previously showed nothing. The legacy
+  `kind=0` path is unchanged and the 546-session legacy fixture still
+  reconciles exactly.
+
+### Added
+
+- `tests/verify-chatsession-formats.js` — builds both the legacy and current
+  shapes as fixtures and asserts each yields a session, turns, tokens, credits,
+  tool calls and subagents, including the filename-only session-id fallback.
+
+## [1.10.96] - 2026-08-15
+
+### Reverted
+
+- **1.10.95's non-blocking initial scan is reverted.** `await runScan()` is
+  restored in `activate()`. Making it fire-and-forget was wrong on three
+  counts:
+
+  1. It re-introduced the regression v1.9.14 shipped and the codebase had
+     already rejected in writing — a dashboard rendering all zeros while the
+     scan runs. The comment recording that decision was removed rather than
+     heeded.
+  2. `runScan().then(…)` carried no `.catch()`, so any throw in the follow-up
+     (status bar, sidebar snapshot, dashboard repaint) became an unhandled
+     promise rejection.
+  3. It was justified by a 90.7 s cold scan measured from a log written when
+     910 sessions existed on disk. Async execution does not make a 90 s scan
+     acceptable — it only moves who waits. If the scan is slow, the scan is
+     what needs fixing.
+
+  The 1.10.93 registration-order fix is kept: the sidebar provider and its
+  `setOnReady` hook are still wired before the first `await`, which is correct
+  and costs nothing. Note this alone does not make the view appear early — VS
+  Code does not dispatch `resolveWebviewView` until `activate()` resolves.
+
+### Known issue
+
+- The scanner's `_sessionBundleCache` / `_debugLogCache` are module-level Maps,
+  so they are discarded on every extension-host restart and each window reload
+  pays a full cold scan (90.7 s on a 910-session profile; ~2 s warm). A
+  persistent on-disk cache keyed by path + mtime is the real fix and is
+  deliberately not attempted here.
+
+## [1.10.95] - 2026-08-15
+
+### Fixed
+
+- **The sidebar was still blank after 1.10.93 — `activate()` blocked on a
+  90-second scan.** Moving `registerWebviewViewProvider` ahead of the awaits was
+  necessary but not sufficient: VS Code does not dispatch `resolveWebviewView`
+  until the activation promise itself resolves, so an early registration inside
+  a still-pending `activate()` changes nothing.
+
+  The extension host log made it unambiguous — the extension activated via
+  `onView:copilotUsage.panel`, created its output channel, then wrote **zero
+  bytes** for the rest of the session, where a healthy session writes ~41 KB.
+  The previous session's log gave the reason:
+
+  ```
+  Scan: 910 sessions, 15388 turns, 62774 tools (90701ms)
+        | Agent: Pi=34 (16764ms) | CLI: (13368ms)
+  ```
+
+  `await runScan()` held activation for ~91 s on a cold cache, so the sidebar
+  stayed blank that entire time — and permanently for anyone reloading more
+  often than that.
+
+  The initial scan is now kicked off rather than awaited, and `activate()` has
+  no top-level `await` left at all. The v1.9.14 concern that motivated the
+  blocking call (a dashboard rendering all zeros) is preserved by an
+  `initialScan` promise: `buildData()` already falls back to an empty scan, so
+  the sidebar paints its placeholder state immediately, and status bar, sidebar
+  and any open dashboard repaint when the scan settles. Both `openDashboard`
+  commands show the panel right away and refresh once `initialScan` resolves.
+
+### Added
+
+- `tests/verify-sidebar-registration-order.js` now also asserts the cold-start
+  scan is kicked off rather than awaited, and that the provider is registered
+  before the scan starts. Verified to fail against the blocking version.
+
+### Known issue
+
+- The 90.7 s cold scan is itself unreasonable and is not addressed here — it no
+  longer blocks the UI, but first-paint data on a large profile still takes that
+  long to arrive. Worth profiling separately.
+
+## [1.10.94] - 2026-08-15
+
+### Fixed
+
+- **Agent calls with no recorded `usage.cost.total` were dropped when other
+  calls to the same model had one.** The agent credit path gated on the
+  per-model sum — `stats.costCredits > 0 ? stats.costCredits : rateEstimate(…)`
+  — so a model with 47 calls where only 1 carried a cost reported that single
+  call and never priced the other 46. Agents populate `usage.cost` on a minority
+  of messages (1,417 of 11,032 — 12.8% — across the observed Pi history), so
+  partial coverage is the normal case, not an edge case. Identical bug class to
+  the per-turn `debugAicCredits > 0` gate fixed for VS Code in 1.10.91.
+
+  `AgentModelTokens` now carries an `unpriced` bucket of the tokens whose calls
+  recorded no cost, and Copilot-routed rows are priced as
+  `ledger + rateEstimate(unpriced)`. Third-party providers are unchanged — they
+  still get no rate estimate, since GitHub's rate card does not price
+  Azure/Anthropic-direct traffic.
+
+- **`modelBreakdown` keyed by model name and latched the first provider seen.**
+  A model served by two providers within one session billed entirely to
+  whichever appeared first. No session in the observed data does this, so the
+  old code was incidentally correct rather than structurally safe — but
+  `claude-opus-5` does run on both Copilot and Azure Foundry. Rows are now keyed
+  by provider + model, with the bare name carried in `stats.model`. Primary-model
+  selection aggregates back across providers so a split model is not beaten by a
+  single-provider one.
+
+### Added
+
+- `tests/verify-agent-cost-coverage.js` — covers partial cost coverage on
+  Copilot-routed rows, no rate estimate for third-party rows, no double-count
+  when coverage is complete, and provider-split keying for one model served by
+  two providers in a single session.
+
+## [1.10.93] - 2026-08-15
+
+### Fixed
+
+- **The "Copilot Usage" Activity Bar sidebar rendered permanently blank.**
+  `registerWebviewViewProvider("copilotUsage.panel", …)` sat ~180 lines into
+  `async activate()`, behind `await runScan()` (a full scan of every
+  workspaceStorage chat session — 909 of them on the reporting profile),
+  `await receiver.start()`, and up to four `await config.update(…)` global
+  settings writes.
+
+  VS Code resolves a `type: "webview"` view as soon as the window restores a
+  pinned sidebar. With no provider registered yet the view paints empty, and
+  a provider arriving after that point does not repaint it — so the panel
+  stayed blank for the whole session, with nothing surfaced in the UI or the
+  output channel to explain why. Reinstalling could not help; the ordering was
+  the same in every build.
+
+  The provider, its two title-bar commands and the `setOnReady` hook are now
+  wired synchronously at the top of `activate()`, before anything is awaited.
+  Nothing there needs scan data: the view serves static HTML and requests a
+  snapshot via its existing `ready` ping, which `pushSidebarSnapshot()` answers
+  safely whether or not a scan has finished.
+
+### Added
+
+- `tests/verify-sidebar-registration-order.js` — parses the compiled
+  `activate()` (skipping strings and comments, and ignoring awaits nested in
+  callbacks) and fails if the provider or `setOnReady` is wired after the first
+  top-level `await`. Verified to fail against the pre-fix ordering.
+- `tests/verify-sidebar-html.js` — parses the sidebar webview's inline script
+  and checks the CSP nonce matches. `verify-webview-html.js` only ever covered
+  `dashboardPanel.js`, so a syntax error in the sidebar produced a silent blank
+  panel with no test coverage.
+
+## [1.10.92] - 2026-08-15
+
+### Fixed
+
+- **OMP / Pi agent sessions written directly into the sessions root were never
+  scanned.** `scanDirectory` enumerated `~/.pi/agent/sessions` (and the OMP
+  equivalent), `stat`-ed each entry and returned early for anything that wasn't
+  a directory — so it only ever read `<root>/<project>/*.jsonl`. Both agents
+  also write loose `<root>/*.jsonl` files when a session has no project context,
+  and every one of those was dropped silently.
+
+  On the reporting profile that hid 9 Pi sessions worth 57 LLM calls and
+  **908.50 credits** of `github-copilot` traffic, so the dashboard's Pi column
+  read 3,435.91 credits where the session files say 4,344.41. Loose root files
+  are now read alongside the per-project ones; non-`.jsonl` and unparseable
+  files at the root are ignored as before.
+
+  `tests/verify-agent-root-sessions.js` builds a synthetic sessions tree with
+  one nested and one loose session (plus a `.txt` and a malformed `.jsonl`) and
+  asserts both are scanned exactly once.
+
+## [1.10.91] - 2026-08-15
+
+### Fixed
+
+- **"Usage by Model" TOTAL disagreed with the hero "AI Credits Spent" tile**
+  (102,462.90 vs 98,450.30 on a reported cycle). The two numbers were computed
+  by two independent passes over the same scan:
+  - The hero sums `aicSummary.byDay`, which is built from `creditEntries` —
+    one entry per `llm_request`, carrying that request's own
+    `copilotUsageNanoAiu`, its own date, and a billable classification.
+  - The table summed `SessionView.aicCredits`, a separate per-*turn* loop that
+    (a) used `turn.debugAicCredits` whenever it was non-zero, silently dropping
+    every rate-estimated request inside turns where only *some* requests
+    reported `copilotUsageNanoAiu`, (b) rate-estimated at the parent turn's
+    model instead of per sub-model (title-gen, subagents), (c) applied no
+    billable filter, and (d) pinned the whole session's lifetime spend to
+    `session.lastDate`, so a session spanning a month boundary reported all of
+    its credits inside whichever month it last ran in.
+
+  `SessionView` now carries `aicByDay` — a per-request-day credit split derived
+  from the *same* `creditEntries` list the headline total is computed from — and
+  `aicCredits` is its sum. Every consumer (Usage-by-Model, the Sessions table
+  and its Cost column, the AIC per-model split, the project cost chart, the
+  sidebar session list) range-filters on that split instead of on `lastDate`.
+  `AICDashboardData.unattributedByDay` exposes the billable credits that belong
+  to no chat session (in-flight OTel requests, OMP / Pi / CLI agent usage), which
+  the table renders as an explicit "Other sources & live" row so its TOTAL equals
+  the hero exactly rather than approximately.
+
+  `tests/verify-model-table-reconciles.js` asserts TOTAL == hero across All
+  Time / This Month / Prev Month / Last 7 days, plus the invariant that the sum
+  of in-cycle session credits never exceeds `aicSummary.totalCredits`.
+
 ## [1.10.90] - 2026-08-07
 
 ### Fixed
