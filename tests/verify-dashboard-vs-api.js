@@ -41,7 +41,7 @@ Module._resolveFilename = function (request, parent, ...rest) {
 
 const { scanWorkspaceStorage, getWorkspaceStorageCandidates } = require(path.join(OUT, "scanner.js"));
 const { buildDashboardData, AIC_EFFECTIVE_DATE } = require(path.join(OUT, "dashboardData.js"));
-const { DEFAULT_AIC_CONFIG, createCalculatorFromConfig } = require(path.join(OUT, "aicCredits.js"));
+const { DEFAULT_AIC_CONFIG, createCalculatorFromConfig, isCopilotVendor } = require(path.join(OUT, "aicCredits.js"));
 const { scanAgentSessions } = require(path.join(OUT, "agentScanner.js"));
 
 // ─── Independent ground-truth parser (no scanner imports) ───
@@ -144,30 +144,37 @@ function parseSessionDir(sessDir) {
   const sessionDirs = discoverDebugLogDirs();
   console.log(`\nDiscovered ${sessionDirs.length} debug-log session dirs (VS Code)`);
 
-  let totalCallsSinceJune = 0;
-  let totalNanoAiuSinceJune = 0;
-  const truthByDay = new Map();    // day → nanoAiu (VS Code only)
-  const truthByModel = new Map();  // model.toLowerCase() → nanoAiu (VS Code only)
-  let truthLastTs = "";
-  let truthLastAiu = 0;
-  for (const sessDir of sessionDirs) {
-    const calls = parseSessionDir(sessDir);
-    for (const c of calls) {
-      if (!c.timestamp || c.timestamp.slice(0, 10) < AIC_EFFECTIVE_DATE) continue;
-      totalCallsSinceJune++;
-      totalNanoAiuSinceJune += c.nanoAiu;
-      const day = c.timestamp.slice(0, 10);
-      truthByDay.set(day, (truthByDay.get(day) ?? 0) + c.nanoAiu);
-      const mk = c.model.toLowerCase();
-      truthByModel.set(mk, (truthByModel.get(mk) ?? 0) + c.nanoAiu);
-      if (c.timestamp > truthLastTs && c.nanoAiu > 0) {
-        truthLastTs = c.timestamp;
-        truthLastAiu = c.nanoAiu;
+  function collectVSCodeTruth() {
+    let calls = 0;
+    let nano = 0;
+    const byDay = new Map();
+    const byModel = new Map();
+    let lastTs = "";
+    let lastAiu = 0;
+    for (const sessDir of sessionDirs) {
+      for (const c of parseSessionDir(sessDir)) {
+        if (!c.timestamp || c.timestamp.slice(0, 10) < AIC_EFFECTIVE_DATE) continue;
+        calls++;
+        nano += c.nanoAiu;
+        const day = c.timestamp.slice(0, 10);
+        byDay.set(day, (byDay.get(day) ?? 0) + c.nanoAiu);
+        const mk = c.model.toLowerCase();
+        byModel.set(mk, (byModel.get(mk) ?? 0) + c.nanoAiu);
+        if (c.timestamp > lastTs && c.nanoAiu > 0) {
+          lastTs = c.timestamp;
+          lastAiu = c.nanoAiu;
+        }
       }
     }
+    return { calls, nano, byDay, byModel, lastTs, lastAiu };
   }
-  const truthVSCodeCredits = totalNanoAiuSinceJune / 1e9;
-  const truthLastReqCredits = truthLastAiu / 1e9;
+
+  const truth0 = collectVSCodeTruth();
+  const totalCallsSinceJune = truth0.calls;
+  const truthByDay = truth0.byDay;
+  const truthByModel = truth0.byModel;
+  const truthVSCodeCredits = truth0.nano / 1e9;
+  const truthLastReqCredits = truth0.lastAiu / 1e9;
   const parseMs = Date.now() - t0;
   console.log(
     `VS Code truth: ${totalCallsSinceJune.toLocaleString()} llm_requests since ${AIC_EFFECTIVE_DATE}, ` +
@@ -220,6 +227,18 @@ function parseSessionDir(sessDir) {
   const activationHistorical = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
   const dash = buildDashboardData(scan, null, DEFAULT_AIC_CONFIG, agentScan, activationHistorical);
 
+  // The scanner re-reads logs this very session may still be appending to, so
+  // the dashboard can legitimately see requests the earlier truth walk missed.
+  // Re-walk now: credits that landed in between are a sampling race, not drift.
+  const truth1 = collectVSCodeTruth();
+  const raceCredits = Math.max(0, (truth1.nano - truth0.nano) / 1e9);
+  if (raceCredits > 0.01) {
+    console.log(
+      `\n⚠ LIVE DATA: ${truth1.calls - truth0.calls} request(s) worth ${raceCredits.toFixed(2)} cr landed ` +
+        `during the scan — tolerances widened by that amount. Re-run while idle for an exact match.`
+    );
+  }
+
   // Dashboard intentionally includes rate-table fallback credits for VS Code
   // turns that have chatSession token counts but no debug-log nanoAIU. Those
   // are not API-truth rows, so track them separately instead of reporting them
@@ -231,6 +250,12 @@ function parseSessionDir(sessDir) {
   for (const t of scan.turns) {
     if (!t.timestamp || t.timestamp.slice(0, 10) < AIC_EFFECTIVE_DATE) continue;
     if ((t.debugAicCredits || 0) > 0 || (t.debugRequests && t.debugRequests.length > 0)) continue;
+    // BYOK/custom-endpoint turns (e.g. Azure Foundry routing) are billed by the
+    // user's own key, never by GitHub — the dashboard excludes them from the
+    // billable total via classifyModelBillability's vendor check (step 4a).
+    // Without this the naive fallback sum below double-counts them as "truth"
+    // that the dashboard is supposedly missing.
+    if (t.modelVendor && !isCopilotVendor(t.modelVendor)) continue;
     const inputTokens = t.debugPromptTokens || t.promptTokens || 0;
     const outputTokens = t.debugOutputTokens || t.outputTokens || 0;
     if (inputTokens <= 0 && outputTokens <= 0) continue;
@@ -257,6 +282,69 @@ function parseSessionDir(sessDir) {
     console.log("  estimated fallback turns        =", `${fallbackTurns} turns, ${fallbackCredits.toFixed(2)} credits`);
   }
 
+  // ─── Cycle-scoped truth ─────────────────────────────────────
+  // aicSummary.totalCredits is deliberately restricted to the current billing
+  // cycle (Fix #2, issue #5) — everything since AIC_EFFECTIVE_DATE (June 1)
+  // is NOT what the dashboard reports once a user has crossed a month
+  // boundary. Comparing the all-time truth above against the cycle-scoped
+  // dashboard total manufactures "drift" that isn't real, so re-scope truth
+  // to the same [billingCycleStart, billingCycleEnd] window before asserting.
+  const cycleStart = dash.aicSummary.billingCycleStart;
+  const cycleEnd = dash.aicSummary.billingCycleEnd;
+  const inCycle = (day) => day >= cycleStart && day <= cycleEnd;
+
+  let truthVSCodeCreditsCycle = 0;
+  for (const [day, nano] of truthByDay) { if (inCycle(day)) truthVSCodeCreditsCycle += nano / 1e9; }
+  const truthByDayCycle = new Map(
+    [...truthByDay].filter(([day]) => inCycle(day)),
+  );
+  const truthByModelCycle = new Map();
+  for (const sessDir of sessionDirs) {
+    for (const call of parseSessionDir(sessDir)) {
+      if (!call.timestamp || !inCycle(call.timestamp.slice(0, 10))) continue;
+      const model = call.model.toLowerCase();
+      truthByModelCycle.set(model, (truthByModelCycle.get(model) ?? 0) + call.nanoAiu);
+    }
+  }
+
+  const agentByDay = new Map();
+  const agentByModelCycle = new Map();
+  let truthOmpCreditsCycle = 0;
+  let truthPiCreditsCycle = 0;
+  for (const session of agentScan.sessions) {
+    const date = new Date(session.lastTs || session.firstTs).toISOString().slice(0, 10);
+    if (date < AIC_EFFECTIVE_DATE) continue;
+    for (const [model, stats] of Object.entries(session.modelBreakdown)) {
+      const grossInput = stats.input + stats.cacheRead + stats.cacheWrite;
+      const usage = calculator.calculateCredits(model, grossInput, stats.output, stats.cacheRead, stats.cacheWrite);
+      agentByDay.set(date, (agentByDay.get(date) ?? 0) + usage.totalCredits);
+      if (inCycle(date)) {
+        const modelKey = usage.model.toLowerCase();
+        agentByModelCycle.set(modelKey, (agentByModelCycle.get(modelKey) ?? 0) + usage.totalCredits);
+        if (session.source === "omp") truthOmpCreditsCycle += usage.totalCredits;
+        else truthPiCreditsCycle += usage.totalCredits;
+      }
+    }
+  }
+
+  let fallbackCreditsCycle = 0;
+  for (const [day, credits] of fallbackByDay) { if (inCycle(day)) fallbackCreditsCycle += credits; }
+  const fallbackByModelCycle = new Map();
+  for (const t of scan.turns) {
+    if (!t.timestamp || !inCycle(t.timestamp.slice(0, 10))) continue;
+    if ((t.debugAicCredits || 0) > 0 || (t.debugRequests && t.debugRequests.length > 0)) continue;
+    if (t.modelVendor && !isCopilotVendor(t.modelVendor)) continue;
+    const inputTokens = t.debugPromptTokens || t.promptTokens || 0;
+    const outputTokens = t.debugOutputTokens || t.outputTokens || 0;
+    if (inputTokens <= 0 && outputTokens <= 0) continue;
+    const usage = calculator.calculateCredits(t.modelFamily || "unknown", inputTokens, outputTokens, t.debugCachedTokens || 0);
+    if (usage.totalCredits <= 0) continue;
+    const model = usage.model.toLowerCase();
+    fallbackByModelCycle.set(model, (fallbackByModelCycle.get(model) ?? 0) + usage.totalCredits);
+  }
+
+  const truthTotalCreditsCycle = truthVSCodeCreditsCycle + truthOmpCreditsCycle + truthPiCreditsCycle;
+
   // ─── Assertions ─────────────────────────────────────────────
   const checks = [];
   function within(label, dashV, truthV, tolPct, tolAbs) {
@@ -266,51 +354,40 @@ function parseSessionDir(sessDir) {
     checks.push({ label, ok, dashV, truthV, diff, pct });
   }
 
-  within("VS Code: agentSummary.vscodeAicCredits ↔ API nanoAIU + estimated fallback",
-    dash.agentSummary.vscodeAicCredits, truthVSCodeCredits + fallbackCredits, 0.5, 0.01);
-  within("OMP: agentSummary.ompTotalCredits ↔ recomputed",
-    dash.agentSummary.ompTotalCredits, truthOmpCredits, 0.5, 0.01);
-  within("Pi: agentSummary.piTotalCredits ↔ recomputed",
-    dash.agentSummary.piTotalCredits, truthPiCredits, 0.5, 0.01);
-  within("TOTAL: aicSummary.totalCredits ↔ API/agent truth + estimated fallback",
-    dash.aicSummary.totalCredits, truthTotalCredits + fallbackCredits, 0.5, 0.01);
+  within(`VS Code: agentSummary.vscodeAicCredits ↔ cycle-scoped API nanoAIU + fallback [${cycleStart}..${cycleEnd}]`,
+    dash.agentSummary.vscodeAicCredits, truthVSCodeCreditsCycle + fallbackCreditsCycle, 0.5, 0.01 + raceCredits);
+  within("OMP: agentSummary.ompTotalCredits ↔ recomputed (cycle-scoped)",
+    dash.agentSummary.ompTotalCredits, truthOmpCreditsCycle, 0.5, 0.01);
+  within("Pi: agentSummary.piTotalCredits ↔ recomputed (cycle-scoped)",
+    dash.agentSummary.piTotalCredits, truthPiCreditsCycle, 0.5, 0.01);
+  within("TOTAL: aicSummary.totalCredits ↔ API/agent truth + fallback (cycle-scoped)",
+    dash.aicSummary.totalCredits, truthTotalCreditsCycle + fallbackCreditsCycle, 0.5, 0.01 + raceCredits);
   within("agentSummary.totalCredits ↔ aicSummary.totalCredits (internal consistency)",
     dash.agentSummary.totalCredits, dash.aicSummary.totalCredits, 0.01, 0.01);
 
   // Per-day (VS Code only — OMP/Pi don't have per-day breakdown wired)
   const dashDayMap = new Map(dash.aicSummary.byDay.map(d => [d.day, d.credits]));
-  // To compare per-day VS Code truth vs dashboard byDay, we have to subtract
-  // OMP/Pi credits per day from the dashboard. Build OMP+Pi per-day truth.
-  const agentByDay = new Map();
-  for (const session of agentScan.sessions) {
-    const date = new Date(session.lastTs || session.firstTs).toISOString().slice(0, 10);
-    if (date < AIC_EFFECTIVE_DATE) continue;
-    for (const [model, stats] of Object.entries(session.modelBreakdown)) {
-      const grossInput = stats.input + stats.cacheRead + stats.cacheWrite;
-      const usage = calculator.calculateCredits(model, grossInput, stats.output, stats.cacheRead, stats.cacheWrite);
-      agentByDay.set(date, (agentByDay.get(date) ?? 0) + usage.totalCredits);
-    }
-  }
 
   let perDayMaxDriftPct = 0;
   let perDayMaxDriftDay = "";
   let perDayMaxDriftAbs = 0;
-  const allDays = new Set([...truthByDay.keys(), ...dashDayMap.keys()]);
+  const allDays = new Set([...truthByDayCycle.keys(), ...dashDayMap.keys()]);
   for (const day of allDays) {
-    const truth = (truthByDay.get(day) ?? 0) / 1e9 + (agentByDay.get(day) ?? 0) + (fallbackByDay.get(day) ?? 0);
+    if (!inCycle(day)) continue; // out-of-cycle days are correctly zeroed on the dashboard
+    const truth = (truthByDayCycle.get(day) ?? 0) / 1e9 + (agentByDay.get(day) ?? 0) + (fallbackByDay.get(day) ?? 0);
     const dash = dashDayMap.get(day) ?? 0;
     const diff = dash - truth;
     const pct = truth !== 0 ? Math.abs(diff / truth) * 100 : (Math.abs(diff) > 0.01 ? Infinity : 0);
     if (pct > perDayMaxDriftPct) { perDayMaxDriftPct = pct; perDayMaxDriftDay = day; perDayMaxDriftAbs = diff; }
   }
   checks.push({
-    label: `byDay parity (max drift ${perDayMaxDriftPct.toFixed(2)}% on ${perDayMaxDriftDay || "—"}, ${perDayMaxDriftAbs.toFixed(2)} cr)`,
-    ok: perDayMaxDriftPct <= 1.0,
+    label: `byDay parity within cycle (max drift ${perDayMaxDriftPct.toFixed(2)}% on ${perDayMaxDriftDay || "—"}, ${perDayMaxDriftAbs.toFixed(2)} cr)`,
+    ok: perDayMaxDriftPct <= 1.0 || Math.abs(perDayMaxDriftAbs) <= raceCredits + 0.01,
     dashV: perDayMaxDriftAbs, truthV: 0, diff: perDayMaxDriftAbs, pct: perDayMaxDriftPct,
   });
 
   within("liveOtel.lastRequestAIC ↔ newest single nanoAiu/1e9",
-    dash.liveOtel.lastRequestAIC, truthLastReqCredits, 0.5, 0.01);
+    dash.liveOtel.lastRequestAIC, truthLastReqCredits, 0.5, 0.01 + raceCredits);
 
   const todayKey = new Date().toISOString().slice(0, 10);
   const truthToday = (truthByDay.get(todayKey) ?? 0) / 1e9 + (agentByDay.get(todayKey) ?? 0);
@@ -323,7 +400,7 @@ function parseSessionDir(sessDir) {
   console.log("  Day         |  VS truth | OMP+Pi   | Fallback |  Total truth |  Dash byDay |   Diff    |    %");
   console.log("  " + "─".repeat(86));
   for (const day of sortedDays) {
-    const vsTruth = (truthByDay.get(day) ?? 0) / 1e9;
+    const vsTruth = (truthByDayCycle.get(day) ?? 0) / 1e9;
     const agentTruth = agentByDay.get(day) ?? 0;
     const fallback = fallbackByDay.get(day) ?? 0;
     const totalTruth = vsTruth + agentTruth + fallback;
@@ -338,9 +415,9 @@ function parseSessionDir(sessDir) {
   const dashModelMap = new Map(dash.aicSummary.byModel.map(m => [m.model.toLowerCase(), m.totalCredits]));
   console.log("  Model                              | Truth     |  Dash     | Diff   | %");
   console.log("  " + "─".repeat(78));
-  const allModels = new Set([...truthByModel.keys(), ...agentByModel.keys(), ...fallbackByModel.keys(), ...dashModelMap.keys()]);
+  const allModels = new Set([...truthByModelCycle.keys(), ...agentByModelCycle.keys(), ...fallbackByModelCycle.keys(), ...dashModelMap.keys()]);
   const truthModels = [...allModels]
-    .map(m => ({ model: m, truth: (truthByModel.get(m) ?? 0) / 1e9 + (agentByModel.get(m) ?? 0) + (fallbackByModel.get(m) ?? 0), dash: dashModelMap.get(m) ?? 0 }))
+    .map(m => ({ model: m, truth: (truthByModelCycle.get(m) ?? 0) / 1e9 + (agentByModelCycle.get(m) ?? 0) + (fallbackByModelCycle.get(m) ?? 0), dash: dashModelMap.get(m) ?? 0 }))
     .sort((a, b) => b.truth - a.truth);
   for (const m of truthModels) {
     const diff = m.dash - m.truth;

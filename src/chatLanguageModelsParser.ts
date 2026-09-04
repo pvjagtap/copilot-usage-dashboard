@@ -27,12 +27,18 @@
  *  • `vendor === "copilot"` means GitHub bills it; anything else
  *    (customendpoint, ollama, lmstudio, anthropic, openai, azure, …) is
  *    third-party / not billed.
- *  • `settings` keys are per-model *option* overrides — in practice only the
- *    Copilot entry uses this block.
+ *  • `settings` keys are per-model *option* overrides and are NOT a vendor
+ *    declaration. VS Code writes them into the Copilot provider entry for
+ *    whichever model is selected in the picker — including BYOK models. A
+ *    real config proved it: `gpt-5.6-sol` is declared only under
+ *    `vendor: "azure"` yet still has a `reasoningEffort` override under the
+ *    Copilot entry's `settings`. So a `settings` key must never be read as
+ *    "Copilot serves this id".
  *  • `models[]` is the documented BYOK declaration array (built-in providers
- *    and Custom Endpoint). Ignoring it was why BYOK ids such as
- *    `claude-opus-5` were never recorded as third-party and instead got
- *    priced by the rate table's family fallback as Copilot premium traffic.
+ *    and Custom Endpoint) and is the only authoritative vendor signal in this
+ *    file. Ignoring it was why BYOK ids such as `claude-opus-5` were never
+ *    recorded as third-party and instead got priced by the rate table's
+ *    family fallback as Copilot premium traffic.
  *  • Providers that enumerate models at runtime (Ollama, LM Studio) may have
  *    neither block — those are covered by the `vscode.lm` registry reader in
  *    `modelCatalog.ts`, and otherwise fall through to `isKnownGHCModel()`.
@@ -51,7 +57,6 @@ interface UserChatProviderEntry {
   name?: string;
   vendor?: string;
   url?: string;
-  settings?: Record<string, unknown>;
   models?: UserChatProviderModelEntry[];
 }
 
@@ -61,13 +66,16 @@ interface UserChatProviderEntry {
  * associations.
  *
  * Rules:
- *  • Model ids listed under `vendor === "copilot"` are IGNORED — they're
+ *  • Only `models[]` declares a vendor. A `settings` key is a per-model
+ *    option override that VS Code also writes under the Copilot entry for
+ *    BYOK models, so it carries no billability information and is skipped.
+ *  • Model ids declared under `vendor === "copilot"` are IGNORED — they're
  *    billable, and the authoritative billing source for them is the CAPI
  *    /models response, not this file.
- *  • If a model id appears under more than one vendor (e.g. both Copilot
+ *  • If a model id is declared under more than one vendor (e.g. both Copilot
  *    and an Anthropic BYOK key), it's AMBIGUOUS — omit from the map. The
  *    classifier will fall back to the CAPI entry / heuristic.
- *  • Only ids appearing under exactly one non-Copilot vendor are recorded.
+ *  • Only ids declared under exactly one non-Copilot vendor are recorded.
  */
 export function parseUserChatLanguageModels(rawJson: string): Map<string, string> {
   const out = new Map<string, string>();
@@ -91,10 +99,6 @@ export function parseUserChatLanguageModels(rawJson: string): Map<string, string
     }
 
     const ids: string[] = [];
-    const settings = entry.settings;
-    if (settings && typeof settings === "object") {
-      ids.push(...Object.keys(settings));
-    }
     if (Array.isArray(entry.models)) {
       for (const m of entry.models) {
         if (typeof m?.id === "string") {

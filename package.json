@@ -2,7 +2,7 @@
   "name": "copilot-usage-dashboard",
   "displayName": "Copilot Usage Dashboard",
   "description": "Live token usage dashboard for GitHub Copilot — prompt, output, and cached tokens with full analytics.",
-  "version": "1.10.99",
+  "version": "1.11.3",
   "publisher": "pvjagtap",
   "icon": "images/icon.png",
   "license": "MIT",
@@ -71,6 +71,10 @@
       {
         "command": "copilotUsage.aic.detectPlan",
         "title": "Copilot Usage: Detect My Copilot Plan"
+      },
+      {
+        "command": "copilotUsage.cacheTtl.toggle",
+        "title": "Copilot Usage: Toggle Prompt-Cache TTL Tracking"
       },
       {
         "command": "copilotUsage.sidebar.refresh",
@@ -262,6 +266,51 @@
         }
       },
       {
+        "title": "Copilot Usage — BYOK Provider Pricing",
+        "properties": {
+          "copilotUsage.byokPricing": {
+            "type": "object",
+            "default": {},
+            "markdownDescription": "What your OWN provider charges for BYOK traffic (Azure AI Foundry, Anthropic direct, OpenAI, …). GitHub does not bill these requests, so they are otherwise shown only as Copilot-equivalent credits — a number that appears on no invoice you receive.\n\nBuilt-in defaults cover Anthropic-family models at published Claude API rates (Opus $5/$25 per Mtok with $0.50 cache reads; Sonnet $2/$10 with $0.20), which Anthropic documents as also being the Microsoft Foundry rate card. Provider dollars are always reported separately and are **never** added to AI credits.",
+            "properties": {
+              "cacheWriteRatio": {
+                "type": "number",
+                "default": 0,
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Fraction of cached tokens to price as cache WRITES (1.25x input) rather than cache READS (0.1x input). VS Code records a single 'cached' figure and does not distinguish the two, so 0 (all reads) is the default and makes the reported cost a lower bound. Raise it if your workload writes cache entries more often than it reads them."
+              },
+              "providers": {
+                "type": "array",
+                "default": [],
+                "description": "Per-provider rate overrides, merged over the built-in defaults by 'match'. Use this when published prices change or when you use a provider with no built-in rates.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "match": { "type": "string", "description": "Case-insensitive substring matched against the provider label recorded for the request (e.g. 'Azure Foundry Anthropic')." },
+                    "regionMultiplier": { "type": "number", "default": 1, "description": "Flat multiplier on every rate. Azure US Data Zone Standard deployments bill 1.1x; Global Standard bills 1.0x." },
+                    "models": {
+                      "type": "array",
+                      "description": "Per-model USD rates per million tokens.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "match": { "type": "string", "description": "Case-insensitive substring matched against the model id (e.g. 'opus')." },
+                          "inputPerMillion": { "type": "number" },
+                          "outputPerMillion": { "type": "number" },
+                          "cachedReadPerMillion": { "type": "number" },
+                          "cacheWritePerMillion": { "type": "number" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
         "title": "Copilot Usage — Daily Limit Guard",
         "properties": {
           "copilotUsage.dailyLimit.enabled": {
@@ -335,13 +384,120 @@
             "description": "Install global GitHub Copilot lifecycle hooks (~/.copilot/hooks) so the daily limit also denies tool calls in Copilot CLI, local custom agents, and the cloud agent. Does not affect plain Copilot Chat Ask mode (use 'strict' enforcement for that). Disable to remove hooks."
           }
         }
+      },
+      {
+        "title": "Copilot Usage — Prompt Cache TTL",
+        "properties": {
+          "copilotUsage.cacheTtl.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Track how long each session's prompt cache stays warm and show a countdown. Sending your next turn before the cache expires re-reads the cached prefix at a fraction of the input rate. Off by default — opt in to activate."
+          },
+          "copilotUsage.cacheTtl.ttl": {
+            "type": "object",
+            "markdownDescription": "Per-provider cache lifetimes, in seconds. Each entry is `{ timerValue, warnAt, alertAt }` — `timerValue` is the assumed full cache lifetime, `warnAt` is the yellow threshold and `alertAt` is the red one. **These are approximate**: only Anthropic documents a prompt-cache TTL (~5 min), so treat the rest as tunable estimates rather than billing guarantees.",
+            "default": {
+              "anthropic": {
+                "timerValue": 300,
+                "warnAt": 120,
+                "alertAt": 30
+              },
+              "openai": {
+                "timerValue": 300,
+                "warnAt": 120,
+                "alertAt": 30
+              },
+              "google": {
+                "timerValue": 300,
+                "warnAt": 120,
+                "alertAt": 30
+              },
+              "xai": {
+                "timerValue": 300,
+                "warnAt": 120,
+                "alertAt": 30
+              },
+              "default": {
+                "timerValue": 300,
+                "warnAt": 120,
+                "alertAt": 30
+              }
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "timerValue": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "warnAt": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "alertAt": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "copilotUsage.cacheTtl.showInStatusBar": {
+            "type": "boolean",
+            "default": true,
+            "description": "Append the most urgent session's cache countdown to the status bar. Turn off to keep the countdown in the sidebar and dashboard only."
+          },
+          "copilotUsage.cacheTtl.soundEnabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Play a sound when a session's prompt cache is about to expire (enters the red state). Off by default."
+          },
+          "copilotUsage.cacheTtl.soundPath": {
+            "type": "string",
+            "default": "",
+            "description": "Absolute path to a sound file for the expiry alert (.wav, .mp3, .ogg, .aiff, .m4a). Leave empty to use the bundled chime. Invalid or missing paths silently fall back to the bundled file."
+          },
+          "copilotUsage.cacheTtl.alertRepeat": {
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "maximum": 10,
+            "description": "How many times to play the expiry sound. Repeats play one after another."
+          },
+          "copilotUsage.cacheTtl.notifyOnRed": {
+            "type": "boolean",
+            "default": false,
+            "description": "Show a warning notification the first time a session's cache is about to expire. Off by default — the status-bar countdown already signals it."
+          },
+          "copilotUsage.cacheTtl.workingGraceSeconds": {
+            "type": "integer",
+            "default": 5,
+            "minimum": 0,
+            "maximum": 300,
+            "description": "For sessions with no turn markers (e.g. Copilot CLI), how long after a request the session is still treated as actively generating (HOT)."
+          },
+          "copilotUsage.cacheTtl.expiredGraceSeconds": {
+            "type": "integer",
+            "default": 30,
+            "minimum": 0,
+            "maximum": 3600,
+            "description": "How long an expired (COLD) session stays listed before it is dropped."
+          },
+          "copilotUsage.cacheTtl.maxSessions": {
+            "type": "integer",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Maximum number of sessions listed in the status-bar tooltip's Cache reuse block."
+          }
+        }
       }
     ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "package": "node -e \"require('fs').mkdirSync('dist',{recursive:true})\" && npm run compile && vsce package --out dist/"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

@@ -110,7 +110,7 @@ const cfg = { ...DEFAULT_AIC_CONFIG };
 {
   console.log("== Test 6: parseUserChatLanguageModels (third-party detection) ==");
   // Sample matches the real shape shown in <UserDir>/chatLanguageModels.json:
-  //   Copilot entry with billable model overrides + an Ollama-style entry.
+  //   Copilot entry with per-model option overrides + a BYOK entry.
   const sample = JSON.stringify([
     {
       name: "Copilot",
@@ -123,9 +123,7 @@ const cfg = { ...DEFAULT_AIC_CONFIG };
     {
       name: "Anthropic (BYOK)",
       vendor: "anthropic",
-      settings: {
-        "claude-opus-4-byok": { apiKey: "redacted" },
-      },
+      models: [{ id: "claude-opus-4-byok" }],
     },
     { name: "Ollama", vendor: "ollama", url: "http://localhost:11434" },
   ]);
@@ -145,8 +143,49 @@ const cfg = { ...DEFAULT_AIC_CONFIG };
     map.get("claude-opus-4-byok") === "anthropic"
   );
   assert(
-    "Ollama entry (no settings block) contributes no specific ids",
+    "Ollama entry (no models block) contributes no specific ids",
     Array.from(map.values()).every(v => v !== "ollama")
+  );
+}
+
+// ── Test 6b: a `settings` key is an option override, never a vendor claim
+{
+  console.log("== Test 6b: parseUserChatLanguageModels (settings keys are not vendor claims) ==");
+  // Verbatim shape from a real user config: `gpt-5.6-sol` exists ONLY under
+  // the `azure` BYOK entry, yet VS Code also wrote a `reasoningEffort`
+  // override for it under the Copilot entry's `settings`. Reading `settings`
+  // as a vendor declaration made every configured BYOK id look like a
+  // Copilot/BYOK collision, so it was dropped as ambiguous and then billed.
+  const sample = JSON.stringify([
+    {
+      name: "Copilot",
+      vendor: "copilot",
+      settings: {
+        "gpt-5.6-sol": { reasoningEffort: "high" },
+        "claude-opus-5": { contextSize: 200000 },
+      },
+    },
+    {
+      name: "Azure Foundry Anthropic",
+      vendor: "customendpoint",
+      models: [{ id: "claude-opus-5" }, { id: "claude-sonnet-5" }],
+    },
+    { name: "Azure-OAI", vendor: "azure", models: [{ id: "gpt-5.6-sol" }] },
+  ]);
+
+  const map = parseUserChatLanguageModels(sample);
+
+  assert(
+    "claude-opus-5 is third-party despite a Copilot `settings` override",
+    map.get("claude-opus-5") === "customendpoint"
+  );
+  assert(
+    "claude-sonnet-5 is third-party",
+    map.get("claude-sonnet-5") === "customendpoint"
+  );
+  assert(
+    "gpt-5.6-sol is third-party despite a Copilot `settings` override",
+    map.get("gpt-5.6-sol") === "azure"
   );
 }
 
@@ -157,17 +196,17 @@ const cfg = { ...DEFAULT_AIC_CONFIG };
     {
       name: "Copilot",
       vendor: "copilot",
-      settings: { "shared-model-x": {} },
+      models: [{ id: "shared-model-x" }],
     },
     {
       name: "BYOK Anthropic",
       vendor: "anthropic",
-      settings: { "shared-model-x": {} },
+      models: [{ id: "shared-model-x" }],
     },
   ]);
   const map = parseUserChatLanguageModels(sample);
   assert(
-    "id listed under both copilot and anthropic is dropped (ambiguous)",
+    "id declared under both copilot and anthropic is dropped (ambiguous)",
     !map.has("shared-model-x")
   );
 }

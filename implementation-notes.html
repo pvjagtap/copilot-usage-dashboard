@@ -21,6 +21,195 @@
 </style>
 </head>
 <body>
+<h2 id="byok-provider-cost">Azure BYOK provider cost — pricing traffic GitHub does not bill (Sep 4, 2026)</h2>
+
+<p><strong>Request:</strong> "for azure specific can we actually plan on having cost per usage and we must
+make it accurate and configurable based on current pricing", then "now costs for azure".</p>
+
+<h3>The problem the credit column could not solve</h3>
+<p>
+BYOK traffic through the user's Azure AI Foundry endpoint is not billed by GitHub. The non-billable panel
+already showed it, but only in <em>AI credits</em> — a Copilot-equivalent figure describing what the traffic
+would have cost had it gone through Copilot. That number appears on no invoice the user receives. The real
+bill comes from Microsoft, in dollars, at Anthropic's rates.
+</p>
+
+<h3>Design decision — raw tokens had to survive aggregation</h3>
+<p>
+The blocking constraint was that credits cannot be converted back into dollars. They were derived with
+Copilot's rate table, so any attempt to reprice them would just re-apply the wrong rates. Provider pricing
+must start from raw token counts. <code>CreditUsage</code> therefore gained optional
+<code>inputTokens</code>/<code>outputTokens</code>/<code>cachedTokens</code>, and — the part that would have
+silently corrupted every figure had it been missed — the <code>accumulate()</code> closure in
+<code>computeSummary()</code> had to sum them. Without that, only the first request per model would have
+contributed tokens and every cost would have been a small fraction of the truth.
+</p>
+
+<h3>Deviation — unmatched rows report "unpriced", not $0.00</h3>
+<p>
+<code>priceTokens()</code> returns <code>null</code> rather than a zero-valued result when no configured rate
+matches. This is deliberate and is the single most important behaviour in the module. A local Ollama model
+and an unconfigured Azure deployment would otherwise both render <code>$0.00</code> — one of which is true and
+one of which is a silent, arbitrarily large under-report. The panel renders an em-dash with a tooltip instead.
+This is the same failure mode that produced the phantom overage charge earlier in this project: a derived
+number presented with more confidence than its provenance supported.
+</p>
+
+<h3>Tradeoff — the dollar figure is a lower bound, by choice</h3>
+<p>
+Anthropic charges three different prices for cache traffic: reads at 0.1x input, 5-minute writes at 1.25x, and
+1-hour writes at 2.0x. VS Code records a <em>single</em> "cached" token count and does not distinguish them.
+For this user 94% of BYOK input is cached, so the choice dominates the result — pricing all cached tokens as
+writes rather than reads changes an opus million from $0.50 to $6.25, a 12.5x swing. The default assumes reads,
+which makes the reported cost a floor rather than a guess that could overstate. <code>cacheWriteRatio</code>
+lets the user shift the split if their workload warrants it, and the caveat is stated in the panel itself.
+</p>
+
+<h3>Confirmed by the user — all deployments are Global Standard</h3>
+<p>
+Azure prices US Data Zone Standard deployments at 1.1x. Deployment type is <em>not</em> derivable from the
+endpoint URL — DNS resolves the host to <code>eastus2</code>, which gives the region but says nothing about
+the deployment tier. Rather than infer it, the question was asked; the answer was global, so
+<code>regionMultiplier</code> defaults to 1.0 and remains configurable for anyone else.
+</p>
+
+<h3>Verification — and why the first result looked like a bug</h3>
+<p>
+The first real-data run produced a dollar figure exactly 100x the credit figure — precisely what a broken
+passthrough would produce. Rather than accept the agreement, it was tested: doubling
+<code>regionMultiplier</code> doubled the cost, proving the figure is driven by tokens and configured rates,
+not copied from credits. The match is genuine. Copilot's opus credit rates (500 / 2500 / 50 per million)
+<em>are</em> Anthropic's dollar rates (\$5 / \$25 / \$0.50) scaled by 100, because a credit is \$0.01. The two
+columns will diverge for any model where Copilot applies a margin, and for cache-write-heavy workloads.
+</p>
+
+<blockquote>
+<strong>Open question:</strong> the dollar figure covers only traffic classified as non-billable. If some Azure
+requests are still being counted as Copilot-billable (the duplicate-row bug fixed earlier this session was
+exactly that), they will be missing from this total. Worth re-checking after any change to model
+classification.
+</blockquote>
+
+<h2 id="quota-reconciliation">AIC drift vs github.com — reconcile with GitHub's quota ledger (Sep 4, 2026)</h2>
+
+<p><strong>Symptom:</strong> the dashboard showed fewer AIC than GitHub's own settings page and the org
+consumption tracker, which agreed with each other. The gap was widening across the cycle rather than staying
+at a fixed offset.</p>
+
+<h3>Root cause — local logs are structurally a lower bound</h3>
+<p>
+Every credit figure in the extension was reconstructed from local debug logs. That reconstruction can never
+exceed what GitHub bills, and falls short in three independent ways:
+</p>
+<table>
+<tr><th>Blind spot</th><th>Measured (Sept cycle)</th></tr>
+<tr><td><code>debugName: "copilotLanguageModelWrapper"</code> requests carry <code>inputTokens</code>/<code>outputTokens</code> but omit <code>copilotUsageNanoAiu</code> entirely, so they can only ever be rate-estimated.</td><td>373 requests, 39M input tokens, ~3,372 credits estimated rather than read.</td></tr>
+<tr><td>Usage billed on another machine, another IDE, github.com, Copilot CLI on a different host, or the cloud agent never writes a local <code>main.jsonl</code>.</td><td>Unbounded — invisible by construction.</td></tr>
+<tr><td>Rotated or deleted debug logs take their credits with them.</td><td>Unbounded.</td></tr>
+</table>
+<p>
+Because each of these accrues monotonically, the gap grows rather than oscillating — which is exactly the
+"drift keeps increasing" behaviour reported.
+</p>
+
+<h3>Design decision — adopt the server total, keep the local breakdown</h3>
+<p>
+<code>GET https://api.github.com/copilot_internal/user</code> (the endpoint the official Copilot extension
+polls for its own quota UI) returns a <code>quota_snapshots.premium_interactions</code> block containing
+<code>credits_used</code>, <code>entitlement</code>, <code>remaining</code> and <code>overage_permitted</code>.
+Verified live: <code>credits_used</code> matched both github.com and the org consumption tracker exactly.
+</p>
+<p>
+New module <code>src/quotaSnapshot.ts</code> fetches it using the same silent VS Code GitHub session
+<code>planDetector</code> already relies on, so there is no new sign-in. <code>buildDashboardData</code> then
+adopts <code>credits_used</code> as the headline and keeps the locally-derived numbers for the one thing the
+API does <em>not</em> provide: attribution per model, per day and per session.
+</p>
+<blockquote>
+Note: <code>/copilot_internal/v2/token</code> — already called twice in this codebase — returns <code>403</code>
+for this payload. <code>/copilot_internal/user</code> is the correct endpoint. Under usage-based billing the
+<code>premium_interactions</code> quota id carries AI credits rather than legacy premium requests; the
+<code>token_based_billing: true</code> flag is what distinguishes the two, and the parser requires it.
+</blockquote>
+
+<h3>Deviation — the budget denominator changed too</h3>
+<p>
+The dashboard was rendering an "over budget pace" banner and a large overage charge for a seat that is in fact
+well inside its allowance. Cause: <code>DEFAULT_PLANS.business.monthlyCreditsIncluded</code> is the
+<em>per-user</em> figure, but Business/Enterprise credits are pooled at the billing entity. GitHub's
+<code>entitlement</code> reports the pooled figure this seat can actually draw on — orders of magnitude larger
+— so when a snapshot is present it now supplies <code>monthlyBudget</code> and <code>creditsRemaining</code>.
+This also removes the phantom overage cost.
+</p>
+
+<h3>Tradeoff — where the unattributed remainder is booked</h3>
+<p>
+The hero, Usage-by-Model TOTAL, the sidebar and the status bar all sum <code>aicSummary.byDay</code>. Adopting
+a larger headline without touching that map would have reintroduced precisely the cross-surface drift
+v1.10.91 eliminated. Options considered:
+</p>
+<table>
+<tr><th>Option</th><th>Verdict</th></tr>
+<tr><td>Leave <code>byDay</code> local; show the server figure only in the hero</td><td>Rejected — the Usage-by-Model total would silently disagree with the hero again.</td></tr>
+<tr><td>Scale every day proportionally to close the gap</td><td>Rejected — fabricates per-day precision we do not have, and corrupts days whose credits are known exactly from <code>nanoAiu</code>.</td></tr>
+<tr><td>Book the remainder on the most recent day with activity <span class="ok">(chosen)</span></td><td>Keeps every surface summing to the reconciled total, leaves exactly-known days untouched, and clamps at zero so a lagging snapshot cannot produce a negative day.</td></tr>
+</table>
+
+<h3>Behaviour when the endpoint is unavailable</h3>
+<p>
+<code>fetchQuotaSnapshot</code> returns <code>null</code> on any failure — offline, no session, endpoint moved —
+and never throws. <code>buildDashboardData</code> then falls back to the locally-derived total and omits the
+<code>quota</code> block entirely, so the extension degrades to exactly its previous behaviour rather than to
+zeros. A 5-minute TTL keeps the added call off the hot refresh path.
+</p>
+
+<h3>Residual drift after the fix</h3>
+<p>
+Live measurement now reports a <code>+72.58</code> delta (0.19% of billed) between the local reconstruction and
+GitHub's ledger — down from the ~800 credit gap, and expected to be non-zero permanently because the wrapper
+blind spot is a property of what VS Code writes, not of our parsing. The <code>quota.localDelta</code> field is
+surfaced in the dashboard note so the residual stays visible instead of silently re-accumulating.
+</p>
+
+<h3>Surfacing the split rather than blending it</h3>
+<p>
+Reconciling the totals fixed the number but hid the provenance: the hero would have shown GitHub's figure with
+no indication that part of it has no local evidence behind it. Two surfaces now say so explicitly.
+</p>
+<ul>
+<li><strong>Hero subtitle</strong> — replaces the sessions/turns line with
+<code>GitHub ledger · N tracked locally · +M unattributed</code>, so the authoritative total and the portion we
+can actually evidence are never conflated.</li>
+<li><strong>Usage-by-Model</strong> — gains an <code>unattributed / no local log</code> row carrying
+<code>quota.localDelta</code>, with em-dashes in the input/output/cached columns because no token counts exist
+for it. Without this row the table sums to the local total while the hero shows GitHub's — visually identical
+to the drift bug we just fixed.</li>
+</ul>
+<p>
+Both are gated on the current-cycle range. The quota snapshot describes one billing cycle only, so historical
+ranges keep the local-only presentation rather than annotating them with a delta that does not apply.
+</p>
+
+<h3>Deviation — pace and projection also had to move basis</h3>
+<p>
+<code>dailyAverage</code> and <code>projectedTotal</code> were still computed from <code>summary</code>, i.e. the
+local total, while the denominator had switched to the pooled entitlement. The hero therefore extrapolated a
+partial run rate against a full pool and rendered a wildly inflated <code>projecting N% of budget</code>
+banner. Both now derive from the reconciled cycle total over in-cycle active days. Two regression assertions
+pin this: the projection must stay under 1000% of budget, and it must never fall below what has already been
+spent.
+</p>
+
+<h3>Open questions</h3>
+<ul>
+<li><code>/copilot_internal/user</code> is an internal endpoint. It is stable enough that the official extension
+depends on it, but it carries no compatibility guarantee — hence the null-safe fallback and the quota-id scan
+that hedges against a rename.</li>
+<li>On a pooled plan, <code>credits_used</code> appears to be this seat's consumption while <code>entitlement</code>
+is the org-wide pool. Worth confirming against a second seat in the same org before relying on the ratio as a
+"percent of budget" signal.</li>
+</ul>
+
 <h2 id="v11091">v1.10.91 — Usage-by-Model vs hero drift (Aug 15, 2026)</h2>
 
 <p><strong>Symptom:</strong> the Usage-by-Model TOTAL row showed <code>102,462.90</code> while the hero
@@ -1235,6 +1424,16 @@ nothing to discount.</p>
   <tr><td><code>tests/verify-sidebar-dashboard-parity.js</code></td><td class="warn">13/14 — the single
       <code>byModel.length ≤ 5</code> failure was reproduced on stashed <code>main</code> before these edits</td></tr>
 </table>
+
+<hr>
+
+<h2>Local credit reconciliation (September 2026)</h2>
+<p>The reported 250+ credit drift was a false audit comparison: all-time raw logs since June and BYOK/custom-endpoint traffic were compared against the dashboard's current-cycle Copilot-billed ledger.</p>
+<p><code>tests/verify-dashboard-vs-api.js</code> now uses the dashboard's billing-cycle bounds and excludes non-Copilot-vendor fallback rows. The verified current-cycle total, daily rows, model rows, live session, and final request all reconcile to the raw local <code>copilotUsageNanoAiu</code> values at 0.00% drift.</p>
+
+<h2>Current model-rate refresh (September 2026)</h2>
+<p>The static fallback table was behind the values shown by the active VS Code Model Provider view: Gemini 3.6 Flash is now 75/375, GPT-5.6 Luna 20/120, GPT-5.6 Sol 200/1000, and GPT-5.6 Terra 200/1200 AI credits per million input/output tokens. MAI Code 1.1 Flash (20/120) was added.</p>
+<p>This affects only live and fallback estimates. Flushed Copilot requests carry <code>copilotUsageNanoAiu</code>, which remains the authoritative source for the headline total and is not recalculated from these rates.</p>
 
 </body>
 </html>

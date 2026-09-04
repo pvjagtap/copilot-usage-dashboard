@@ -11,6 +11,7 @@ import { DashboardData, SessionView } from "./dashboardData";
 import { Turn } from "./scanner";
 import { LiveStats } from "./otelReceiver";
 import { computeCacheHit } from "./cache";
+import { SessionTtl, TtlState, stateDisplay } from "./ttlState";
 
 // ─── DTO ──────────────────────────────────────────────────────
 
@@ -104,6 +105,32 @@ export interface SidebarSessions {
   total: number;
 }
 
+/** One row of the sidebar's Cache reuse card. */
+export interface SidebarTtlRow {
+  title: string;
+  state: TtlState;
+  /** Pre-rendered `HOT` / `COLD` / `M:SS`, so the webview does no time math. */
+  display: string;
+  /** Fraction of the assumed cache lifetime still remaining, 0–1. */
+  fraction: number;
+  provider: string;
+  source: "vscode" | "cli";
+  costUsd: number;
+}
+
+/**
+ * Prompt-cache countdown block. Null when `copilotUsage.cacheTtl.enabled` is
+ * off or nothing is currently within a cache window.
+ */
+export interface SidebarTtl {
+  lead: SidebarTtlRow;
+  rows: SidebarTtlRow[];
+  /** Live sessions whose cache has not yet expired. */
+  warmCount: number;
+  /** Cycle-wide cache-hit rate, mirrored from `breakdown.cacheHitPct`. */
+  cacheHitPct: number;
+}
+
 export interface SidebarSnapshot {
   status: SidebarStatusRow;
   lastRequest: SidebarLastRequest | null;
@@ -112,6 +139,7 @@ export interface SidebarSnapshot {
   pace: SidebarPace;
   breakdown: SidebarBreakdown;
   sessions: SidebarSessions;
+  ttl: SidebarTtl | null;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
@@ -147,6 +175,8 @@ export interface SidebarBuildInput {
   currentSessionTurns: number;
   currentSessionDurationMin: number;
   activationTime: string;
+  /** Most-urgent-first TTL sessions from `TtlTracker`. Empty when disabled. */
+  ttlSessions?: SessionTtl[];
 }
 
 export function buildSidebarSnapshot(input: SidebarBuildInput): SidebarSnapshot {
@@ -392,6 +422,32 @@ export function buildSidebarSnapshot(input: SidebarBuildInput): SidebarSnapshot 
     pace,
     breakdown,
     sessions: { rows, total: sessionsSorted.length },
+    ttl: buildTtlBlock(input.ttlSessions ?? [], breakdown.cacheHitPct),
+  };
+}
+
+/** Project TTL sessions into the sidebar DTO. Pure reshaping — no new math. */
+function buildTtlBlock(sessions: SessionTtl[], cacheHitPct: number): SidebarTtl | null {
+  if (sessions.length === 0) {
+    return null;
+  }
+  const rows: SidebarTtlRow[] = sessions.slice(0, 8).map(s => ({
+    title: s.title,
+    state: s.state,
+    display: stateDisplay(s.state, s.remaining),
+    fraction:
+      s.state === "hot"
+        ? 1
+        : Math.max(0, Math.min(1, s.timerValue > 0 ? s.remaining / s.timerValue : 0)),
+    provider: s.provider,
+    source: s.source,
+    costUsd: s.costUsd,
+  }));
+  return {
+    lead: rows[0],
+    rows,
+    warmCount: sessions.filter(s => s.state !== "cold").length,
+    cacheHitPct,
   };
 }
 

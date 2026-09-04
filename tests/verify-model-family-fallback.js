@@ -75,7 +75,7 @@ for (const [id, expectFrom, input, output, tier] of [
   ["gpt-5.7", "gpt-5.5", 500, 3000, "premium"],
   ["gpt-5.7-codex", "gpt-5.3-codex", 175, 1400, "premium"],
   ["gpt-5.9-mini", "gpt-5.4-mini", 75, 450, "base"],
-  ["gemini-4.0-flash", "gemini-3.6-flash", 150, 750, "base"],
+  ["gemini-4.0-flash", "gemini-3.6-flash", 75, 375, "base"],
 ]) {
   const r = rateOf(id);
   ok(

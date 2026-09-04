@@ -70,7 +70,7 @@ const USER_CONFIG = JSON.stringify([
     },
   },
   {
-    name: "Azure Founday Anthropic",
+    name: "Azure Foundry Anthropic",
     vendor: "customendpoint",
     apiKey: "${input:chat.lm.secret.-27b7acf0}",
     models: [
@@ -91,14 +91,28 @@ console.log("\n== Test 1: parser reads the documented models[] array ==");
 
 console.log("\n== Test 2: models[] ids that collide with Copilot ids are ambiguous ==");
 {
-  // Same id under both vendors → omitted, classifier falls back to CAPI.
+  // Same id declared under both vendors → omitted, classifier falls back to CAPI.
   const map = parseUserChatLanguageModels(
     JSON.stringify([
-      { name: "Copilot", vendor: "copilot", settings: { "claude-opus-5": {} } },
+      { name: "Copilot", vendor: "copilot", models: [{ id: "claude-opus-5" }] },
       { name: "BYOK", vendor: "customendpoint", models: [{ id: "claude-opus-5" }] },
     ]),
   );
-  ok("id listed under both copilot and BYOK is dropped", map.has("claude-opus-5") === false);
+  ok("id declared under both copilot and BYOK is dropped", map.has("claude-opus-5") === false);
+}
+
+console.log("\n== Test 2b: a Copilot `settings` override does NOT create a collision ==");
+{
+  // The real config: VS Code writes a per-model option override under the
+  // Copilot entry for the BYOK model the user selected in the picker. That is
+  // not a vendor declaration and must not make the id look ambiguous.
+  const map = parseUserChatLanguageModels(
+    JSON.stringify([
+      { name: "Copilot", vendor: "copilot", settings: { "claude-opus-5": { contextSize: 200000 } } },
+      { name: "BYOK", vendor: "customendpoint", models: [{ id: "claude-opus-5" }] },
+    ]),
+  );
+  ok("claude-opus-5 stays third-party", map.get("claude-opus-5") === "customendpoint", `got ${map.get("claude-opus-5")}`);
 }
 
 const calc = new AICCalculator(DEFAULT_MODEL_COSTS, undefined);

@@ -380,6 +380,41 @@ body {
 .bar-row .value { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; padding-left: 4px; }
 .card { min-width: 0; }
 
+/* ── Prompt-cache TTL ────────────────────────────────────── */
+.ttl-lead {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.ttl-lead .clock { font-size: 18px; font-weight: 600; line-height: 1.1; }
+.ttl-track {
+  height: 6px;
+  background: var(--vscode-progressBar-background, #2b2b2b);
+  border-radius: 3px;
+  overflow: hidden;
+  opacity: 0.45;
+  margin: 6px 0 4px;
+}
+.ttl-fill { height: 100%; border-radius: 3px; transition: width 0.9s linear; }
+.ttl-fill[data-state="hot"]    { background: var(--vscode-charts-blue, #4da3ff); }
+.ttl-fill[data-state="green"]  { background: var(--vscode-charts-green, #3fb950); }
+.ttl-fill[data-state="yellow"] { background: var(--vscode-charts-yellow, #d29922); }
+.ttl-fill[data-state="red"]    { background: var(--vscode-charts-red, #f85149); }
+.ttl-fill[data-state="cold"]   { background: var(--vscode-descriptionForeground, #888); }
+.ttl-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 0;
+  min-width: 0;
+}
+.ttl-row .clock { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ttl-row .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ttl-row .value { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
 /* ── Pace progress (with overage state) ──────────────────── */
 .pace-bar {
   height: 8px;
@@ -597,8 +632,48 @@ const SIDEBAR_JS = `
 
     // Order: pair (Last Request + Session side-by-side) first — the two
     // "current activity" cards live together at the top. Then the Today /
-    // Week KPI row, then the Pace card.
-    body.innerHTML = pairBlock + kpiCard + paceCard;
+    // Week KPI row, the cache-reuse countdown, then the Pace card.
+    body.innerHTML = pairBlock + kpiCard + ttlCard(s.ttl) + paceCard;
+  }
+
+  // Cache reuse: how good the reuse is (hit rate) plus how long it lasts
+  // (countdown) on one card — the two halves of the same question.
+  function ttlCard(t) {
+    if (!t) return '';
+    const lead = t.lead;
+    const pct = (lead.fraction * 100).toFixed(1);
+    const hit = t.cacheHitPct > 0
+      ? '<span class="chip base">' + t.cacheHitPct.toFixed(0) + '% hit</span>'
+      : '';
+    let rows = '';
+    if (t.rows.length > 1) {
+      for (const r of t.rows) {
+        rows +=
+          '<div class="ttl-row">' +
+            '<span class="clock">' + stateDot(r.state) + ' ' + esc(r.display) + '</span>' +
+            '<span class="label" title="' + esc(r.title) + '">' + esc(r.title) + '</span>' +
+            '<span class="value">' + fmtUsd(r.costUsd) + '</span>' +
+          '</div>';
+      }
+    }
+    return '<div class="card">' +
+        '<div class="card-title"><span>🧊 Cache Reuse</span>' + hit + '</div>' +
+        '<div class="ttl-lead">' +
+          '<span class="clock">' + stateDot(lead.state) + ' ' + esc(lead.display) + '</span>' +
+          '<span class="muted small">' + esc(lead.provider) + '</span>' +
+        '</div>' +
+        '<div class="ttl-track"><div class="ttl-fill" data-state="' + esc(lead.state) + '" style="width:' + pct + '%"></div></div>' +
+        '<div class="muted tiny">' + t.warmCount + ' warm · lifetimes approximate</div>' +
+        rows +
+      '</div>';
+  }
+
+  function stateDot(state) {
+    return state === 'hot' ? '🔥'
+      : state === 'green' ? '🟢'
+      : state === 'yellow' ? '🟡'
+      : state === 'red' ? '🔴'
+      : '❄️';
   }
 
   function renderBreakdown(b) {

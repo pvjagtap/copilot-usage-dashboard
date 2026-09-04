@@ -45,7 +45,7 @@ let m, count = 0;
 while ((m = scriptRe.exec(html)) !== null) {
   count++;
   try {
-    // eslint-disable-next-line no-new-func
+     
     new Function(m[1]);
     console.log(`  PASS  inline script #${count} parses (${m[1].length} chars)`);
   } catch (e) {

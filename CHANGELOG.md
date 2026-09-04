@@ -5,6 +5,265 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.3] - 2026-09-04
+
+### Fixed
+
+- **The AIC total drifted below github.com, and the gap kept growing.** The
+  dashboard reported fewer credits than GitHub's own settings page for the same
+  cycle — an offset that widened rather than holding steady.
+
+  Every credit figure was reconstructed from local debug logs, which is
+  structurally a *lower bound* on what GitHub bills. Three blind spots feed it,
+  and all three accrue monotonically, so the gap can only widen:
+
+  - Requests dispatched through VS Code's public `LanguageModelChat` API
+    (`debugName: "copilotLanguageModelWrapper"`) record `inputTokens` and
+    `outputTokens` but omit `copilotUsageNanoAiu` entirely, so they were only
+    ever rate-estimated. They can account for hundreds of requests in a cycle.
+  - Usage billed on another machine, another IDE, github.com, or the cloud agent
+    never writes a local `main.jsonl` at all.
+  - Rotated or deleted debug logs take their credits with them.
+
+  New `quotaSnapshot` module reads GitHub's own ledger from
+  `GET /copilot_internal/user` → `quota_snapshots.premium_interactions`, the
+  same endpoint the official Copilot extension polls for its quota UI. Its
+  `credits_used` now drives the headline, while the locally-derived numbers
+  continue to supply the per-model, per-day and per-session attribution the API
+  does not provide. The residual delta is surfaced in the dashboard note so it
+  stays visible rather than silently re-accumulating.
+
+  Reconciliation is applied to `aicSummary.byDay` as well, not just the hero, so
+  the Usage-by-Model total, the sidebar and the status bar cannot drift apart
+  again — the single-credit-basis guarantee from 1.10.91 still holds.
+
+- **An "over budget pace" banner on a seat well inside its allowance.**
+  `monthlyBudget` came from the plan table's *per-user* figure, but Business and
+  Enterprise credits are pooled at the billing entity. GitHub's `entitlement`
+  reports the pooled figure the seat can actually draw on, and now supplies both
+  `monthlyBudget` and `creditsRemaining`, which also clears the phantom overage
+  cost that the mismatch produced.
+
+- **Daily pace and the projection were still computed on the local basis**, so
+  the hero divided a partial run rate by the active-day count and extrapolated
+  it against the pooled entitlement — the source of a wildly inflated
+  "projecting N% of budget" banner. Both now derive from the reconciled cycle
+  total.
+
+### Added
+
+- **The hero and the model table now show where each credit came from.** The
+  headline is GitHub's figure; its subtitle breaks out how much of it the local
+  logs actually account for and how much is unattributed, and Usage-by-Model
+  gains an `unattributed / no local log` row so the table still totals to the
+  hero instead of quietly falling short of it. Both appear only for the current
+  cycle, which is the only range the quota snapshot covers.
+
+- **BYOK traffic is now priced in the currency you are actually billed in.**
+  Requests through your own Azure AI Foundry / Anthropic / OpenAI endpoint are
+  not billed by GitHub, so the non-billable panel could only ever show them as
+  *Copilot-equivalent* credits — a number that appears on no invoice you
+  receive. A **Provider cost** column now applies your provider's published
+  per-token rates to the same traffic and reports real USD, kept strictly
+  separate from AI credits because it is a different vendor's bill.
+
+  Built-in defaults cover the Anthropic family at published Claude API rates
+  (Opus `$5`/`$25` per Mtok with `$0.50` cache reads; Sonnet `$2`/`$10` with
+  `$0.20`), which Anthropic documents as also being the Microsoft Foundry rate
+  card. Everything is overridable through `copilotUsage.byokPricing`, including
+  a `regionMultiplier` for Azure US Data Zone deployments (`1.1x`).
+
+  Two deliberate constraints, both visible in the UI:
+
+  - A model with **no configured rate renders `—`, never `$0.00`**. A local
+    Ollama model and an unconfigured Azure deployment would otherwise look
+    identical, and only one of them is genuinely free.
+  - The total is a **lower bound**. Anthropic prices cache reads at `0.1x` and
+    cache writes at `1.25x`–`2.0x`, but VS Code records a single `cached` count
+    and cannot distinguish them. Cached tokens are priced as reads by default;
+    `copilotUsage.byokPricing.cacheWriteRatio` shifts the split.
+
+### Notes
+
+- The quota call reuses the silent GitHub session `planDetector` already
+  establishes — no new sign-in, and a 5-minute TTL keeps it off the hot refresh
+  path.
+- Every failure mode (offline, no session, endpoint moved) falls back to the
+  previous locally-derived behaviour and omits the `quota` block. Nothing
+  degrades to zeros.
+
+## [1.11.2] - 2026-08-23
+
+### Fixed
+
+- **BYOK rows lost the provider label 1.11.1 had just added.** The non-billable
+  table still showed a bare `claude-opus-5` alongside the correctly-labelled
+  `Azure Foundry Anthropic/claude-opus-5`, as if two different models were in
+  play.
+
+  The label was being attached correctly and then discarded one layer down.
+  `computeSummary` reports the rate-table id that `calculateCredits` matched, so
+  `Azure Foundry Anthropic/claude-opus-5` substring-matched `claude-opus-5` and
+  came back renamed to it. The branch handling rows with a real billed figure
+  already kept the caller's name for non-billable rows; the rate-estimate branch
+  did not.
+
+  That is exactly backwards from what the split needs: BYOK traffic by
+  definition carries no `copilotUsageNanoAiu`, so it always takes the estimate
+  branch — the only rows the label exists for were the only rows losing it.
+  Agent rows kept theirs because they carry a provider cost ledger and take the
+  other branch, which is why the two spellings appeared side by side.
+
+  Non-billable rows now keep the name the caller supplied on both paths. Credit
+  totals are unchanged — this is a labelling fix, and billable rows still use
+  the bare id so they stay comparable with GitHub's own reporting.
+
+  Traffic that reached a BYOK provider through a Copilot-vendor turn still shows
+  a bare id: there is no recorded provider name to attribute it to, and
+  inventing one would be worse than leaving it unqualified.
+
+## [1.11.1] - 2026-08-23
+
+### Fixed
+
+- **Agent rows showed `0.00` input credits.** Every Azure-routed Claude row in
+  the non-billable table reported no input spend at all, with the entire ledger
+  total pushed into output and cached.
+
+  Agent sessions report `input` already net of cache, but the calculator
+  subtracts cache from whatever `inputTokens` it is handed — so the cached
+  tokens were being deducted twice. On a cache-heavy session that is fatal
+  rather than merely inaccurate: `claude-opus-5` recorded 1,840 net input
+  tokens against 235M cache reads, so the subtraction clamped at zero and the
+  input share vanished. Agent tokens are now passed gross, matching the
+  convention already documented in `agentScanner.ts`.
+
+  Only the split across input/output/cached changes; the agent's own ledger
+  total is still reported exactly as recorded, so no headline figure moves.
+  Sessions with no cache activity are unaffected.
+
+- **BYOK traffic is now attributed by recorded routing, not inference.** A model
+  sold by both Copilot and your own key — `claude-opus-5` served from an Azure
+  AI Foundry endpoint — was billed as Copilot premium. The classifier had no
+  per-request proof of which route a call took, so the id matching the premium
+  rate table won.
+
+  VS Code records the answer on every request. Each one carries a vendor-prefixed
+  `modelId` (`copilot/claude-opus-5` vs
+  `customendpoint/Azure Foundry Anthropic/claude-opus-5`), and the session header
+  repeats it as `selectedModel.metadata.vendor`. The scanner discarded that
+  prefix to recover the bare model name. It now keeps the vendor and carries it
+  through to classification, where a non-Copilot vendor marks the request
+  non-billable outright.
+
+  This is observed routing rather than an inference from `chatLanguageModels.json`,
+  so it resolves colliding ids without consulting the model catalog at all.
+  A real `copilotUsageNanoAiu` figure still wins — GitHub having actually billed
+  a request is stronger evidence than any local signal — and turns with no
+  recorded vendor keep the previous BYOK-wrapper heuristic unchanged. Auxiliary
+  calls within a turn (title generation, subagent rounds) are excluded, since
+  those run on Copilot's own route regardless of the model you picked.
+
+  A turn's vendor is not pinned to auxiliary calls it dispatches on other
+  models — title generation and subagent rounds run on Copilot's route whatever
+  you picked, so inheriting a BYOK vendor there would wrongly demote billable
+  usage. Matching the turn's model is the usual proof of ownership, but it
+  rejected a real case: a subagent running `claude-opus-5` inside a
+  `claude-sonnet-5` turn on the *same* Azure endpoint. Those 339 requests fell
+  back to the wrapper heuristic and appeared as a second, unlabelled
+  `claude-opus-5` row. A request dispatched through the public LanguageModelChat
+  wrapper is BYOK-served by definition, so that now counts as proof on its own
+  (verified: 698 of 698 wrapper requests reported zero credits — no exceptions).
+
+  Non-billable rows are now labelled with the provider you named —
+  `Azure Foundry Anthropic/claude-opus-5` — so they are distinguishable from the
+  genuine Copilot model. VS Code's own `customendpoint` vendor string is a
+  transport mechanism rather than a provider, so it only appears when no name
+  was recorded. Billable rows keep the bare id to stay comparable with GitHub's
+  own reporting.
+
+- **Live session credits were double-counted across model-version aliases.** A
+  request billed at 5.0 credits reported 11.0. The debug log records the API
+  *response* model while OTel records the *request* model, so one call surfaces
+  as both `claude-opus-4.7` and `claude-opus-4.6`. Reconciliation already
+  matched those by family, but the per-model rollup keyed on the minor-versioned
+  name — so the OTel spelling found no exact match, looked unbilled, and had a
+  full rate estimate added on top of the exact credits. Rows whose family
+  already carries exact debug credits no longer take the estimate.
+
+  This surfaced only because the regression test guarding it had never actually
+  executed: `verify-live-aic-reconciliation.js` imported `dashboardData` without
+  the `vscode` stub, so the require chain threw before the first assertion. The
+  stub is now installed and all three cases run.
+
+- **Catalog schema bumps no longer fail their own tests.** Two fixtures pinned
+  `vendorMapVersion: 2` as a literal, so raising the parser to v3 made a
+  current-schema snapshot look stale and forced a refresh the tests were
+  written to prove would not happen. `VENDOR_MAP_VERSION` is exported and the
+  fixtures track it.
+
+- **The status-bar hover no longer flickers once a second.** The TTL countdown
+  ticks every second, and each tick reassigned `item.tooltip` — which makes
+  VS Code tear down and re-lay-out an open hover. The tooltip is now rebuilt
+  only when a session actually changes colour band, keyed on `sessionId:state`
+  with the per-second `remaining` value deliberately excluded. The bar text
+  still updates every second.
+
+  Tradeoff: an open hover no longer counts down. It holds the value it was
+  opened with until a band changes. A live countdown requires reassigning the
+  tooltip, which is precisely what caused the flicker.
+
+- **A single cache-TTL row no longer stretches the whole hover.** The hover
+  sizes itself to its widest line, so one long row distorted every other
+  section. Three things were inflating it: session titles truncated at 34
+  characters (now 22 in this surface only — the sidebar keeps 34), a redundant
+  provider label such as `customendpoint`, and a `$0.00` cost carrying no
+  information. Cost now appears only when non-zero. The trailing note is
+  wrapped across two lines for the same reason.
+
+### Added
+
+- **Prompt-cache TTL tracking.** The dashboard already reported the cache hit
+  rate *after the fact*; it could not tell you the one thing that actually
+  changes the bill — whether your next turn will still hit that cache. Providers
+  expire a cached prefix after a few minutes of inactivity, and once it lapses
+  the entire conversation is re-billed at the full input rate. On a long agent
+  session with a 95%+ hit rate that is the difference between a few credits and
+  a few hundred.
+
+  A live countdown now shows how long each session's cache stays warm, derived
+  from the `turn_start` / `turn_end` / `llm_request` timestamps the scanner
+  already reads. It surfaces in four places:
+
+  - **Status bar** — the most urgent session's countdown, appended to the
+    existing item. Never a second status-bar entry.
+  - **Status-bar tooltip** — folded into the existing *Cache reuse* card, with
+    a per-session table (state, title, provider, spend).
+  - **Sidebar** — a *Cache Reuse* card with a progress bar per session.
+  - **Dashboard** — a *Cache TTL* column on the sessions table that ticks in
+    the webview.
+
+  Sessions still generating show `HOT` rather than a countdown, because the
+  cache is being refreshed as they run. Copilot CLI sessions are tracked too,
+  via the same `~/.copilot/session-state` events the CLI scanner reads.
+
+  Off by default — enable `copilotUsage.cacheTtl.enabled`. Lifetimes are
+  per-provider and configurable under `copilotUsage.cacheTtl.ttl`; only
+  Anthropic documents a TTL (~5 min), so the rest ship as tunable estimates and
+  are labelled approximate in the UI. Optional expiry sound
+  (`soundEnabled`) and notification (`notifyOnRed`) are both off by default.
+
+  Derived in part from [cache-timer](https://github.com/sukumarp2022/cache-timer)
+  (MIT © 2026 sukumarp2022) — see `NOTICE`. The timer math and alert gating are
+  ported; the polling data layer is not, since this extension's incremental,
+  watcher-driven scanner already had the timestamps.
+
+### Changed
+
+- The 1s countdown tick only runs while the feature is enabled, the window is
+  focused, and at least one session is warm. It is pure arithmetic over cached
+  state — it never triggers a scan.
+
 ## [1.10.99] - 2026-08-15
 
 ### Fixed

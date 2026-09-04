@@ -97,6 +97,60 @@ Credits are calculated as: `(net_input_tokens / 1M) × inputRate + (output_token
 
 Anthropic models also incur cache write costs: `(cache_write_tokens / 1M) × cacheWriteRate`
 
+### BYOK Provider Cost
+
+Everything above is denominated in **AI credits** — GitHub's unit. Traffic
+through your own endpoint (Azure AI Foundry, Anthropic, OpenAI, Ollama) is not
+billed by GitHub at all, so credits describe only what it *would* have cost on
+Copilot. `copilotUsage.byokPricing` prices that same traffic in the currency you
+are actually invoiced in:
+
+```json
+"copilotUsage.byokPricing": {
+  "cacheWriteRatio": 0,
+  "providers": [
+    {
+      "match": "Azure Foundry Anthropic",
+      "regionMultiplier": 1.0,
+      "models": [
+        {
+          "match": "opus",
+          "inputPerMillion": 5.0,
+          "outputPerMillion": 25.0,
+          "cachedReadPerMillion": 0.5,
+          "cacheWritePerMillion": 6.25
+        }
+      ]
+    }
+  ]
+}
+```
+
+`providers[].match` is matched case-insensitively against `"<provider label> <model id>"`;
+`models[].match` against the model id. **Longest match wins**, so a specific
+deployment entry beats a generic family entry regardless of array order.
+Overrides merge over the built-in defaults by `match`, so an empty object keeps
+the shipped Anthropic rates.
+
+Cost is `(input − cached)/1M × inputRate + output/1M × outputRate + cached/1M × cacheRate`,
+all scaled by `regionMultiplier`. Cached tokens are subtracted from input to
+avoid billing the same token twice — on a cache-heavy agent workload that
+double-count would roughly double the figure.
+
+Two deliberate behaviours:
+
+- **No matching rate returns `null`, rendered as `—`.** Never `$0.00`. An
+  unconfigured Azure deployment and a genuinely free local model would
+  otherwise be indistinguishable, and one of those is an unbounded
+  under-report.
+- **The result is a lower bound.** Anthropic prices cache reads at `0.1×` input
+  and cache writes at `1.25×`–`2.0×`, but VS Code records a single `cached`
+  count with no way to separate them. `cacheWriteRatio` (default `0`, all
+  reads) sets the assumed split.
+
+Provider dollars are reported in their own column and are never summed into
+credits — they are separate vendors' bills.
+
 ## Daily AI Credit Limit Guard
 
 Cap daily spend independently of the monthly AIC budget. Disabled by default — enable in Settings → search `copilotUsage.dailyLimit`.
@@ -122,6 +176,7 @@ When enabled, the extension installs `PreToolUse` and `UserPromptSubmit` lifecyc
 
 - Unified usage across VS Code Copilot Chat, Oh My Pi, and Pi sessions
 - AI Credits tracking with configurable per-model rates
+- BYOK provider cost in real USD for Azure / Anthropic / OpenAI endpoints GitHub does not bill
 - Budget monitoring with uncapped overage percentage, days-of-runway, projected end-of-cycle
 - Hero KPI cards, tabbed Breakdown (Model / Project / Tool / Subagent), collapsible expanders, side-by-side Trend charts
 - Token counts (prompt, output, cached) per session, model, project, day

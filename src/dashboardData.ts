@@ -3,14 +3,16 @@
  * Ports get_dashboard_data() from dashboard.py to TypeScript.
  */
 
-import { ScanResult, Session, Turn, ToolCall, Subagent, ScanStats, DebugRequest } from "./scanner";
+import { ScanResult, Session, Turn, ToolCall, Subagent, ScanStats, DebugRequest, providerLabel } from "./scanner";
 import { AgentScanResult } from "./agentScanner";
 import { CliScanResult } from "./cliScanner";
 import { LiveStats, OTelRequest } from "./otelReceiver";
-import { AICCalculator, AICConfig, DEFAULT_AIC_CONFIG, createCalculatorFromConfig, getPromoInfo, classifyModelBillability, isByokWrapperCall } from "./aicCredits";
+import { AICCalculator, AICConfig, CreditUsage, DEFAULT_AIC_CONFIG, createCalculatorFromConfig, getPromoInfo, classifyModelBillability, isByokWrapperCall, isCopilotVendor } from "./aicCredits";
+import { ByokPricingConfig, mergePricingConfig, priceTokens } from "./byokPricing";
 import { classifyByCatalog, getCachedCatalog } from "./modelCatalog";
 import { MachineView } from "./machineSync";
 import { computeCacheHit } from "./cache";
+import { QuotaSnapshot } from "./quotaSnapshot";
 
 /**
  * AIC billing effective date. Only sessions/turns on or after this date
@@ -57,6 +59,40 @@ function modelFamily(model: string): string {
   return normalizeRequestModel(model)
     .replace(/-\d{4}[-.]?\d{2}[-.]?\d{2}$/, "")   // strip date suffix
     .replace(/\.\d+$/, "");                         // strip trailing .X
+}
+
+/**
+ * Whether `turn`'s recorded vendor describes this particular request.
+ *
+ * A turn dispatches more than the model the user picked: title generation,
+ * history summarisation and subagent rounds run on their own models via
+ * Copilot's route, so the turn's vendor must not be pinned to those. Matching
+ * the model is the usual proof, but a request dispatched through the public
+ * LanguageModelChat wrapper is BYOK-served by definition — that holds even
+ * when a subagent within the turn ran a different model on the same provider,
+ * which the model check alone would reject.
+ */
+function vendorApplies(turn: Turn, model: string, debugName?: string): boolean {
+  if (!turn.modelVendor) {
+    return false;
+  }
+  if (modelFamily(model) === modelFamily(turn.modelFamily)) {
+    return true;
+  }
+  return isByokWrapperCall(debugName) && !isCopilotVendor(turn.modelVendor);
+}
+
+/** The vendor VS Code recorded for `model` within `turn`, or undefined. */
+function vendorFor(turn: Turn, model: string, debugName?: string): string | undefined {
+  return vendorApplies(turn, model, debugName) ? turn.modelVendor : undefined;
+}
+
+/** Provider display name for `model`, under the same guard as `vendorFor`. */
+function providerFor(turn: Turn, model: string, debugName?: string): string | undefined {
+  if (!turn.modelProvider) {
+    return undefined;
+  }
+  return vendorApplies(turn, model, debugName) ? turn.modelProvider : undefined;
 }
 
 function debugRequestsFromTurns(turns: Turn[]): DebugRequest[] {
@@ -260,6 +296,23 @@ export interface DashboardData {
   machines?: MachineView[];
   /** Σ `machines[].cycleCredits` for the current cycle. */
   combinedCycleCredits?: number;
+  /**
+   * Prompt-cache TTL anchors keyed by sessionId, populated by the caller from
+   * `TtlTracker`. Raw epoch-ms + thresholds rather than a rendered countdown,
+   * so the webview can tick the clock itself between data pushes. Empty or
+   * absent when `copilotUsage.cacheTtl.enabled` is off.
+   */
+  ttlBySession?: Record<string, TtlAnchor>;
+}
+
+/** Everything the webview needs to render a live countdown for one session. */
+export interface TtlAnchor {
+  lastRequestMs: number;
+  timerValue: number;
+  warnAt: number;
+  alertAt: number;
+  working: boolean;
+  provider: string;
 }
 
 /** Per-source usage breakdown: VS Code chatSessions, Oh My Pi agent, Pi coding agent */
@@ -368,6 +421,12 @@ export interface AICDashboardData {
    */
   nonBillable: {
     totalCredits: number;
+    /**
+     * What the user's OWN provider charges for this traffic, in USD. A
+     * different vendor's bill in a different currency — never added to
+     * credits. Undefined when no configured rate matched the row.
+     */
+    totalProviderUsd?: number;
     byModel: Array<{
       model: string;
       tier: string;
@@ -375,6 +434,7 @@ export interface AICDashboardData {
       outputCredits: number;
       cachedCredits: number;
       totalCredits: number;
+      providerUsd?: number;
     }>;
     /**
      * Per-day, per-model rows. The webview re-aggregates these for the
@@ -389,6 +449,7 @@ export interface AICDashboardData {
       outputCredits: number;
       cachedCredits: number;
       totalCredits: number;
+      providerUsd?: number;
     }>;
   };
   /** Promotional period info */
@@ -412,6 +473,27 @@ export interface AICDashboardData {
   };
   /** Whether credits come from actual API billing data (true) or computed estimates (false) */
   isActualFromApi: boolean;
+  /**
+   * Reconciliation against GitHub's own credit ledger
+   * (`/copilot_internal/user` → `quota_snapshots`). Absent when the endpoint
+   * was unreachable, in which case every figure above is locally derived.
+   */
+  quota?: {
+    /** AI credits GitHub has billed this cycle — authoritative. */
+    creditsUsed: number;
+    /** Cycle entitlement (pooled for Business/Enterprise). */
+    entitlement: number;
+    /** Credits left before overage. */
+    remaining: number;
+    /** `creditsUsed` − locally derived total. Positive ⇒ we under-counted. */
+    localDelta: number;
+    /** The locally derived total, retained for the drift diagnostic. */
+    localTotal: number;
+    /** Whether overage spend is permitted on this seat. */
+    overagePermitted: boolean;
+    /** Server timestamp of the snapshot. */
+    timestampUtc?: string;
+  };
 }
 
 export interface LiveOtelData {
@@ -662,7 +744,7 @@ function computeAllModels(turns: Turn[]): string[] {
 // authoritative debug-log `copilotUsageNanoAiu`, while not-yet-flushed live
 // OTel calls are added as temporary estimates.
 
-export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null, aicConfig?: AICConfig, agentScan?: AgentScanResult, activationTime?: string, cliScan?: CliScanResult): DashboardData {
+export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null, aicConfig?: AICConfig, agentScan?: AgentScanResult, activationTime?: string, cliScan?: CliScanResult, quotaSnapshot?: QuotaSnapshot | null, byokPricing?: Partial<ByokPricingConfig>): DashboardData {
   // Create AIC calculator early so it can be used in session views
   const config = aicConfig ?? DEFAULT_AIC_CONFIG;
   const calculator = createCalculatorFromConfig(config);
@@ -695,9 +777,16 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     const debugRequestsToday = debugRequestsInWindow(scan.turns, todayDate, activationTime);
 
     const exactByModel = new Map<string, { model: string; prompt: number; output: number; cached: number; calls: number; nanoAiu: number }>();
+    // Families (minor version stripped) that carry exact debug credits. Keyed
+    // loosely on purpose: `exactByModel` keys keep the minor version, so they
+    // can't answer "is this OTel spelling already billed?" on their own.
+    const exactFamilies = new Set<string>();
     const addExactModel = (model: string, prompt: number, output: number, cached: number, calls: number, nanoAiu: number) => {
       const displayModel = canonicalBillingModel(calculator, model);
       const key = displayModel.toLowerCase();
+      if (nanoAiu > 0) {
+        exactFamilies.add(modelFamily(model));
+      }
       const row = exactByModel.get(key) ?? { model: displayModel, prompt: 0, output: 0, cached: 0, calls: 0, nanoAiu: 0 };
       row.prompt += prompt;
       row.output += output;
@@ -793,7 +882,16 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         ? calculator.calculateCredits(live.model, live.prompt, live.completion, live.cached, live.cacheWrite).totalCredits
         : 0;
       const reconciledCredits = (exact ? exact.nanoAiu / 1e9 : 0) + (pending?.credits ?? 0);
-      const credits = reconciledCredits > 0 ? reconciledCredits : fallbackEstimate;
+      // The debug log records the API *response* model while OTel records the
+      // *request* model, so the same call can appear as `claude-opus-4.7` and
+      // `claude-opus-4.6`. `unflushedOtelRequests` already reconciles those by
+      // family, but these keys keep the minor version — so without the family
+      // check the OTel spelling looks like an unbilled model and its rate
+      // estimate lands on top of the exact credits, double-counting the call.
+      const familyAlreadyExact = live ? exactFamilies.has(modelFamily(live.model)) : false;
+      const credits = reconciledCredits > 0
+        ? reconciledCredits
+        : familyAlreadyExact ? 0 : fallbackEstimate;
       // `hasActualCredits` is the "GitHub already billed it" signal — only
       // true when the debug-log overlay populated `exact.nanoAiu > 0` for
       // this row. `pending` credits are OTel rate-table estimates and do
@@ -1200,6 +1298,24 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
   // `lastRequestAIC` is intentionally left untouched — it shows the user
   // the LATEST request's value (even if non-billable), which is the most
   // useful debugging signal.
+  // Recorded vendor per model, from the turns that dispatched it. A model
+  // reached by both routes is left unattributed so the catalog/wrapper rules
+  // decide, exactly as before.
+  const vendorByModel = new Map<string, string | undefined>();
+  for (const t of scan.turns) {
+    if (!t.modelVendor) {
+      continue;
+    }
+    const key = modelFamily(t.modelFamily || "");
+    if (!key) {
+      continue;
+    }
+    if (vendorByModel.has(key) && vendorByModel.get(key) !== t.modelVendor) {
+      vendorByModel.set(key, undefined);
+    } else if (!vendorByModel.has(key)) {
+      vendorByModel.set(key, t.modelVendor);
+    }
+  }
   liveOtel.byModel = liveOtel.byModel.map(row => ({
     ...row,
     // CRITICAL: pass `row.hasActualCredits` (NOT a hardcoded `false`) so the
@@ -1210,7 +1326,15 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     // to non-billable for users with BYOK Anthropic configured, dropping
     // `sessionAIC` to 0.00 while individual byModel rows still showed real
     // billed credits. `excludeModels` still wins (user explicit override).
-    isBillable: classifyModelBillability(calculator, config, row.model, row.hasActualCredits, classifyByCatalog),
+    isBillable: classifyModelBillability(
+      calculator,
+      config,
+      row.model,
+      row.hasActualCredits,
+      classifyByCatalog,
+      undefined,
+      vendorByModel.get(modelFamily(row.model)),
+    ),
     cacheHitPct: computeCacheHit(row.prompt, row.cached).pct,
   }));
   // Aggregate cache-hit — one place, one formula. See cache.ts.
@@ -1285,8 +1409,62 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     sessionId?: string;
     source: "vscode" | "otel" | "omp" | "pi" | "cli";
   }> = [];
-  const classify = (model: string, hasActual: boolean, sourceHint?: string): boolean =>
-    classifyModelBillability(calculator, config, model, hasActual, classifyByCatalog, sourceHint);
+  const classify = (
+    model: string,
+    hasActual: boolean,
+    sourceHint?: string,
+    recordedVendor?: string,
+  ): boolean =>
+    classifyModelBillability(
+      calculator,
+      config,
+      model,
+      hasActual,
+      classifyByCatalog,
+      sourceHint,
+      recordedVendor,
+    );
+  // Which BYOK provider serves each model id, learned from turns that did
+  // record one. A wrapper request proves BYOK routing but carries no provider
+  // name of its own, and VS Code stamps `vendor: copilot` on the turn whenever
+  // the picker sits on a Copilot model — so without this the same BYOK traffic
+  // splits into a labelled and an unlabelled row for one physical endpoint.
+  const byokProviderByModel = new Map<string, string>();
+  for (const t of aicTurns) {
+    if (!t.modelVendor || isCopilotVendor(t.modelVendor) || !t.modelFamily) {
+      continue;
+    }
+    const label = providerLabel(t.modelVendor, t.modelProvider ?? "");
+    if (label) {
+      byokProviderByModel.set(modelFamily(t.modelFamily), label);
+    }
+  }
+
+  // A BYOK-served id is indistinguishable from the Copilot model of the same
+  // name once it reaches the tables, so qualify it the way OMP/Pi rows already
+  // are. Only applied to non-billable rows: the prefix must never reach a
+  // billable row, whose id has to keep matching GitHub's own reporting.
+  const displayName = (
+    model: string,
+    billable: boolean,
+    vendor?: string,
+    provider?: string,
+    debugName?: string,
+  ): string => {
+    if (billable) {
+      return model;
+    }
+    if (vendor && !isCopilotVendor(vendor)) {
+      return `${providerLabel(vendor, provider ?? "")}/${model}`;
+    }
+    if (isByokWrapperCall(debugName)) {
+      const known = byokProviderByModel.get(modelFamily(model));
+      if (known) {
+        return `${known}/${model}`;
+      }
+    }
+    return model;
+  };
   for (const t of aicTurns) {
     if (t.debugRequests && t.debugRequests.length > 0) {
       for (const req of t.debugRequests) {
@@ -1298,14 +1476,16 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           continue;
         }
         const hasNano = req.nanoAiu > 0;
+        const vendor = vendorFor(t, req.model, req.debugName);
+        const billable = classify(req.model, hasNano, req.debugName, vendor);
         creditEntries.push({
-          model: req.model,
+          model: displayName(req.model, billable, vendor, providerFor(t, req.model, req.debugName), req.debugName),
           inputTokens: req.prompt,
           outputTokens: req.output,
           cachedTokens: req.cached,
           date,
           actualCredits: hasNano ? req.nanoAiu / 1_000_000_000 : undefined,
-          billable: classify(req.model, hasNano, req.debugName),
+          billable,
           sessionId: t.sessionId,
           source: "vscode",
         });
@@ -1314,14 +1494,16 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
       const date = t.timestamp.slice(0, 10);
       for (const [model, mt] of Object.entries(t.debugByModel)) {
         const hasNano = mt.nanoAiu > 0;
+        const vendor = vendorFor(t, model);
+        const billable = classify(model, hasNano, undefined, vendor);
         creditEntries.push({
-          model,
+          model: displayName(model, billable, vendor, providerFor(t, model)),
           inputTokens: mt.prompt,
           outputTokens: mt.output,
           cachedTokens: mt.cached,
           date,
           actualCredits: hasNano ? mt.nanoAiu / 1_000_000_000 : undefined,
-          billable: classify(model, hasNano),
+          billable,
           sessionId: t.sessionId,
           source: "vscode",
         });
@@ -1330,15 +1512,20 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
       const date = t.timestamp.slice(0, 10);
       const hasNano = t.debugAicCredits > 0;
       const model = t.modelFamily || "unknown";
+      const vendor = vendorFor(t, model);
+      const billable = classify(model, hasNano, undefined, vendor);
       creditEntries.push({
-        model,
+        model: displayName(model, billable, vendor, providerFor(t, model)),
         inputTokens: t.debugPromptTokens || t.promptTokens,
         outputTokens: t.debugOutputTokens || t.outputTokens,
-        cachedTokens: 0, // cached not available per-turn from chatSession data
+        // scanner.ts sets debugCachedTokens alongside debugPromptTokens/debugAicCredits
+        // (same synthetic per-turn aggregate) — was hardcoded 0, over-billing cache-heavy
+        // turns at full input rate whenever debugAicCredits lagged behind debugPromptTokens.
+        cachedTokens: t.debugCachedTokens || 0,
         date,
         // Actual AIC from API (if available) — overrides computed credits
         actualCredits: hasNano ? t.debugAicCredits : undefined,
-        billable: classify(model, hasNano),
+        billable,
         sessionId: t.sessionId,
         source: "vscode",
       });
@@ -1464,9 +1651,16 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         const displayModel = providerIsThirdParty ? `${provider}/${model}` : model;
         // Tokens are carried so computeSummary can split the ledger total across
         // input/output/cached; the total itself always comes from actualCredits.
+        //
+        // `stats.input` is NET of cache, but the calculator subtracts cache from
+        // whatever it is given — so passing net makes it subtract twice. On a
+        // cache-heavy agent session (net 1.8K vs 235M cache-read) that drives
+        // the input share to zero and, with output alone, collapses the whole
+        // apportionment. Pass GROSS, matching the convention documented in
+        // agentScanner.ts.
         creditEntries.push({
           model: displayModel,
-          inputTokens: stats.input,
+          inputTokens: stats.input + stats.cacheRead + stats.cacheWrite,
           outputTokens: stats.output,
           cachedTokens: stats.cacheRead,
           date,
@@ -1613,7 +1807,26 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
 
   // Promo detection: auto-detect if we're in the June 1 – Sept 1, 2026 window
   const promoInfo = getPromoInfo(config.plan, summary.plan.monthlyCreditsIncluded);
-  const totalCr = Math.round(summary.totalCredits * 100) / 100;
+  const localTotalCr = Math.round(summary.totalCredits * 100) / 100;
+
+  // ─── Reconcile against GitHub's ledger ────────────────────────
+  //
+  // Everything above is reconstructed from local debug logs, which can only
+  // ever be a lower bound on what GitHub bills:
+  //   • usage on another machine / IDE / github.com / the cloud agent never
+  //     writes a local log at all;
+  //   • `copilotLanguageModelWrapper` requests omit `copilotUsageNanoAiu`,
+  //     so they are rate-estimated rather than read;
+  //   • rotated or deleted logs take their credits with them.
+  //
+  // The gap therefore grows monotonically across a cycle, which is exactly
+  // the drift users report against github.com. When GitHub's own
+  // `quota_snapshots` figure is available it is authoritative, so adopt it
+  // for the headline and keep the local breakdown for attribution.
+  const quotaUsed = quotaSnapshot ? Math.round(quotaSnapshot.creditsUsed * 100) / 100 : 0;
+  const useQuota = !!quotaSnapshot && quotaUsed > 0;
+  const totalCr = useQuota ? quotaUsed : localTotalCr;
+  const quotaDelta = useQuota ? Math.round((quotaUsed - localTotalCr) * 100) / 100 : 0;
 
   // Compute overage under both promo and standard budgets
   const overageStandard = Math.max(0, totalCr - promoInfo.standardBudget) * (config.overageCostPerCredit ?? 0.01);
@@ -1621,12 +1834,71 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     ? Math.max(0, totalCr - promoInfo.promoBudget) * (config.overageCostPerCredit ?? 0.01)
     : 0;
 
-  // If promo is active, use promo budget as the effective budget
-  const effectiveBudget = promoInfo.isPromoActive && promoInfo.promoBudget > 0
-    ? promoInfo.promoBudget
-    : summary.plan.monthlyCreditsIncluded;
-  const effectiveRemaining = Math.max(0, effectiveBudget - totalCr);
-  const effectiveOverage = Math.max(0, totalCr - effectiveBudget) * (config.overageCostPerCredit ?? 0.01);
+  // GitHub's `entitlement` is the real allowance for this seat — on a pooled
+  // Business/Enterprise plan that is the org-wide pool, not the per-user
+  // 1,900, which is why the local plan table renders "2000% of budget" for a
+  // seat that is in fact well inside its allowance.
+  const effectiveBudget = useQuota && quotaSnapshot!.entitlement > 0
+    ? quotaSnapshot!.entitlement
+    : promoInfo.isPromoActive && promoInfo.promoBudget > 0
+      ? promoInfo.promoBudget
+      : summary.plan.monthlyCreditsIncluded;
+  const effectiveRemaining = useQuota
+    ? Math.max(0, Math.round(quotaSnapshot!.remaining * 100) / 100)
+    : Math.max(0, effectiveBudget - totalCr);
+  // GitHub counts overage itself. Deriving it from total-minus-budget assumes
+  // our total and its entitlement share a basis, which is exactly the
+  // assumption that produced a phantom overage charge.
+  const overageCredits = useQuota
+    ? quotaSnapshot!.overageCount
+    : Math.max(0, totalCr - effectiveBudget);
+  const effectiveOverage = overageCredits * (config.overageCostPerCredit ?? 0.01);
+
+  // Fold the unattributed remainder into `byDay` so every surface that sums
+  // the day map (hero tile, Usage-by-Model total, sidebar, status bar) lands
+  // on the same reconciled number. Booking it on the most recent day with
+  // activity keeps the calendar's shape honest — we know the credits were
+  // spent, just not which local session produced them.
+  const reconciledByDay = new Map(summary.byDay);
+  if (quotaDelta !== 0) {
+    const cycleDays = [...reconciledByDay.keys()]
+      .filter(d => d >= summary.billingCycleStart && d <= summary.billingCycleEnd)
+      .sort();
+    const anchor = cycleDays[cycleDays.length - 1]
+      ?? new Date().toISOString().slice(0, 10);
+    reconciledByDay.set(anchor, Math.max(0, (reconciledByDay.get(anchor) ?? 0) + quotaDelta));
+  }
+
+  // Pace and projection must derive from the reconciled total too, or the
+  // hero projects a local-only run rate against a pooled budget and reports
+  // percentages in the thousands.
+  const activeDays = [...reconciledByDay.entries()]
+    .filter(([d, c]) => c > 0 && d >= summary.billingCycleStart && d <= summary.billingCycleEnd).length;
+  const reconciledDailyAvg = useQuota && activeDays > 0 ? totalCr / activeDays : summary.dailyAverage;
+  const reconciledProjected = useQuota
+    ? totalCr + reconciledDailyAvg * summary.daysRemaining
+    : summary.projectedTotal;
+
+  // BYOK rows repriced at the user's own provider rates. The qualified model
+  // id carries both provider and family, so it is the whole matching subject.
+  const pricing = mergePricingConfig(byokPricing);
+  const providerUsdFor = (m: CreditUsage): number | undefined => {
+    const cost = priceTokens(pricing, m.model, m.model, {
+      inputTokens: m.inputTokens ?? 0,
+      outputTokens: m.outputTokens ?? 0,
+      cachedTokens: m.cachedTokens ?? 0,
+    });
+    return cost ? Math.round(cost.totalUsd * 100) / 100 : undefined;
+  };
+  // Undefined rather than 0 when nothing matched — a real $0.00 and "no rate
+  // configured" must not render identically.
+  let nbTotalUsd: number | undefined;
+  for (const m of summary.nonBillable.byModel.values()) {
+    const usd = providerUsdFor(m);
+    if (usd !== undefined) {
+      nbTotalUsd = (nbTotalUsd ?? 0) + usd;
+    }
+  }
 
   const aicSummary: AICDashboardData = {
     totalCredits: totalCr,
@@ -1641,8 +1913,8 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     billingCycleStart: summary.billingCycleStart,
     billingCycleEnd: summary.billingCycleEnd,
     daysRemaining: summary.daysRemaining,
-    dailyAverage: Math.round(summary.dailyAverage * 100) / 100,
-    projectedTotal: Math.round(summary.projectedTotal * 100) / 100,
+    dailyAverage: Math.round(reconciledDailyAvg * 100) / 100,
+    projectedTotal: Math.round(reconciledProjected * 100) / 100,
     byModel: Array.from(summary.byModel.values()).map(m => ({
       model: m.model,
       tier: m.tier,
@@ -1651,7 +1923,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
       cachedCredits: Math.round(m.cachedCredits * 100) / 100,
       totalCredits: Math.round(m.totalCredits * 100) / 100,
     })).sort((a, b) => b.totalCredits - a.totalCredits),
-    byDay: Array.from(summary.byDay.entries())
+    byDay: Array.from(reconciledByDay.entries())
       .map(([day, credits]) => ({ day, credits: Math.round(credits * 100) / 100 }))
       .sort((a, b) => a.day.localeCompare(b.day)),
     unattributedByDay: Array.from(unattributedByDay.entries())
@@ -1661,6 +1933,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     config,
     nonBillable: {
       totalCredits: Math.round(summary.nonBillable.totalCredits * 100) / 100,
+      totalProviderUsd: nbTotalUsd === undefined ? undefined : Math.round(nbTotalUsd * 100) / 100,
       byModel: Array.from(summary.nonBillable.byModel.values()).map(m => ({
         model: m.model,
         tier: m.tier,
@@ -1668,6 +1941,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
         outputCredits: Math.round(m.outputCredits * 100) / 100,
         cachedCredits: Math.round(m.cachedCredits * 100) / 100,
         totalCredits: Math.round(m.totalCredits * 100) / 100,
+        providerUsd: providerUsdFor(m),
       })).sort((a, b) => b.totalCredits - a.totalCredits),
       byDay: Array.from(summary.nonBillable.byDay.entries()).flatMap(([day, models]) =>
         Array.from(models.values()).map(m => ({
@@ -1678,6 +1952,7 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
           outputCredits: Math.round(m.outputCredits * 100) / 100,
           cachedCredits: Math.round(m.cachedCredits * 100) / 100,
           totalCredits: Math.round(m.totalCredits * 100) / 100,
+          providerUsd: providerUsdFor(m),
         })),
       ).sort((a, b) => a.day.localeCompare(b.day)),
     },
@@ -1691,7 +1966,18 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
       creditsRemainingStandard: Math.round(Math.max(0, promoInfo.standardBudget - totalCr) * 100) / 100,
       promoEndDate: promoInfo.promoEndDate,
     },
-    isActualFromApi: hasActualAic,
+    isActualFromApi: hasActualAic || useQuota,
+    quota: quotaSnapshot
+      ? {
+          creditsUsed: quotaUsed,
+          entitlement: quotaSnapshot.entitlement,
+          remaining: quotaSnapshot.remaining,
+          localDelta: quotaDelta,
+          localTotal: localTotalCr,
+          overagePermitted: quotaSnapshot.overagePermitted,
+          timestampUtc: quotaSnapshot.timestampUtc,
+        }
+      : undefined,
   };
 
   // ─── Per-Source Usage Summary ─────────────────────────────────

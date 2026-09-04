@@ -78,6 +78,14 @@ export interface CreditUsage {
   model: string;
   /** Cost tier applied */
   tier: "base" | "premium" | "custom";
+  /**
+   * Raw tokens behind these credits. Carried so BYOK rows can be repriced at
+   * the user's own provider rates — credits alone cannot be, since they were
+   * derived with Copilot's table.
+   */
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
 }
 
 /**
@@ -162,9 +170,9 @@ export const DEFAULT_MODEL_COSTS: ModelCostRate[] = [
   // Source: https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing#openai
   { model: "gpt-4o-mini",          inputCreditsPerMillion: 15,  outputCreditsPerMillion: 60,   cachedInputCreditsPerMillion: 7.5,  cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gpt-4o",               inputCreditsPerMillion: 250, outputCreditsPerMillion: 1000, cachedInputCreditsPerMillion: 125,  cacheWriteCreditsPerMillion: 0, tier: "base" },
-  { model: "gpt-5.6-sol",         inputCreditsPerMillion: 500, outputCreditsPerMillion: 3000, cachedInputCreditsPerMillion: 50,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
-  { model: "gpt-5.6-terra",       inputCreditsPerMillion: 250, outputCreditsPerMillion: 1500, cachedInputCreditsPerMillion: 25,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
-  { model: "gpt-5.6-luna",        inputCreditsPerMillion: 100, outputCreditsPerMillion: 600,  cachedInputCreditsPerMillion: 10,   cacheWriteCreditsPerMillion: 0, tier: "base" },
+  { model: "gpt-5.6-sol",         inputCreditsPerMillion: 200, outputCreditsPerMillion: 1000, cachedInputCreditsPerMillion: 50,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
+  { model: "gpt-5.6-terra",       inputCreditsPerMillion: 200, outputCreditsPerMillion: 1200, cachedInputCreditsPerMillion: 25,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
+  { model: "gpt-5.6-luna",        inputCreditsPerMillion: 20,  outputCreditsPerMillion: 120,  cachedInputCreditsPerMillion: 10,   cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gpt-5.5",             inputCreditsPerMillion: 500, outputCreditsPerMillion: 3000, cachedInputCreditsPerMillion: 50,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
   { model: "gpt-5.4",             inputCreditsPerMillion: 250, outputCreditsPerMillion: 1500, cachedInputCreditsPerMillion: 25,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
   { model: "gpt-5.4-mini",        inputCreditsPerMillion: 75,  outputCreditsPerMillion: 450,  cachedInputCreditsPerMillion: 7.5,  cacheWriteCreditsPerMillion: 0, tier: "base" },
@@ -177,7 +185,7 @@ export const DEFAULT_MODEL_COSTS: ModelCostRate[] = [
 
   // ── Google ──
   // Source: https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing#google
-  { model: "gemini-3.6-flash",    inputCreditsPerMillion: 150, outputCreditsPerMillion: 750,  cachedInputCreditsPerMillion: 15,   cacheWriteCreditsPerMillion: 0, tier: "base" },
+  { model: "gemini-3.6-flash",    inputCreditsPerMillion: 75,  outputCreditsPerMillion: 375,  cachedInputCreditsPerMillion: 15,   cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gemini-3.5-flash",    inputCreditsPerMillion: 150, outputCreditsPerMillion: 900,  cachedInputCreditsPerMillion: 15,   cacheWriteCreditsPerMillion: 0, tier: "base" },
   { model: "gemini-3.1-pro",      inputCreditsPerMillion: 200, outputCreditsPerMillion: 1200, cachedInputCreditsPerMillion: 20,   cacheWriteCreditsPerMillion: 0, tier: "premium" },
   { model: "gemini-3-flash",      inputCreditsPerMillion: 50,  outputCreditsPerMillion: 300,  cachedInputCreditsPerMillion: 5,    cacheWriteCreditsPerMillion: 0, tier: "base" },
@@ -185,6 +193,7 @@ export const DEFAULT_MODEL_COSTS: ModelCostRate[] = [
 
   // ── Microsoft ──
   { model: "mai-code-1-flash",    inputCreditsPerMillion: 75,  outputCreditsPerMillion: 450,  cachedInputCreditsPerMillion: 7,    cacheWriteCreditsPerMillion: 0, tier: "base" },
+  { model: "mai-code-1.1-flash",  inputCreditsPerMillion: 20,  outputCreditsPerMillion: 120,  cachedInputCreditsPerMillion: 2,    cacheWriteCreditsPerMillion: 0, tier: "base" },
 
   // ── xAI ──
   { model: "grok-4.5",            inputCreditsPerMillion: 200, outputCreditsPerMillion: 600,  cachedInputCreditsPerMillion: 20,   cacheWriteCreditsPerMillion: 0, tier: "base" },
@@ -544,6 +553,9 @@ export class AICCalculator {
       totalCredits: inputCredits + outputCredits + cachedCredits + cacheWriteCredits,
       model: rate.model,
       tier: rate.tier,
+      inputTokens,
+      outputTokens,
+      cachedTokens,
     };
   }
 
@@ -607,6 +619,9 @@ export class AICCalculator {
         existing.outputCredits += usage.outputCredits;
         existing.cachedCredits += usage.cachedCredits;
         existing.totalCredits += usage.totalCredits;
+        existing.inputTokens = (existing.inputTokens ?? 0) + (usage.inputTokens ?? 0);
+        existing.outputTokens = (existing.outputTokens ?? 0) + (usage.outputTokens ?? 0);
+        existing.cachedTokens = (existing.cachedTokens ?? 0) + (usage.cachedTokens ?? 0);
       } else {
         map.set(usage.model, { ...usage });
       }
@@ -646,6 +661,9 @@ export class AICCalculator {
             totalCredits: entry.actualCredits,
             model: entry.billable === false ? entry.model : rate?.model ?? entry.model,
             tier: rate?.tier ?? "premium",
+            inputTokens: entry.inputTokens,
+            outputTokens: entry.outputTokens,
+            cachedTokens: entry.cachedTokens,
           };
         } else {
           // No rate match or zero token counts (e.g. OMP/Pi agent entries
@@ -657,6 +675,9 @@ export class AICCalculator {
             totalCredits: entry.actualCredits,
             model: entry.billable === false ? entry.model : rate?.model ?? entry.model,
             tier: rate?.tier ?? "premium",
+            inputTokens: entry.inputTokens,
+            outputTokens: entry.outputTokens,
+            cachedTokens: entry.cachedTokens,
           };
         }
       } else {
@@ -666,6 +687,14 @@ export class AICCalculator {
           entry.outputTokens,
           entry.cachedTokens,
         );
+        // `calculateCredits` reports the rate-table id it matched, which drops
+        // any provider prefix the caller attached. For a non-billable row that
+        // prefix is the only thing distinguishing BYOK traffic from the
+        // identically-named Copilot model, so keep the caller's name — same
+        // rule the `actualCredits` branch above already applies.
+        if (entry.billable === false) {
+          usage = { ...usage, model: entry.model };
+        }
       }
 
       // Billable classification. Caller's explicit `billable` flag wins —
@@ -902,6 +931,11 @@ export function createCalculatorFromConfig(config: AICConfig): AICCalculator {
  *   2. `hasActualCredits === true`      — GitHub's backend already billed it → billable.
  *   3. `config.extraBilledModels`       — substring match → billable.
  *   4. `config.includeOnlyBilledModels === false` → everything else billable.
+ *  4a. `recordedVendor` — the vendor VS Code stamped on the request's own
+ *      `modelId`. Observed routing, not inference, so it settles ids sold by
+ *      both Copilot and a BYOK key without consulting the rate table.
+ *  4b. BYOK wrapper `debugName` + user-declared third-party vendor — the
+ *      fallback for rows that carry no recorded vendor.
  *   5. Local GitHub model table         — known Copilot model ids are billable.
  *      This intentionally runs before third-party/user-config demotions so
  *      GitHub model names do not appear in the non-billable panel just because
@@ -980,6 +1014,15 @@ function isCopilotResolvedModelId(modelName: string): boolean {
   return /^(capi|capui)[-_]/.test(lower);
 }
 
+/**
+ * Whether a vendor string recorded by VS Code denotes Copilot's own route.
+ * Anything else (`customendpoint`, `ollama`, `azure`, …) is a BYOK provider
+ * the user pays for directly.
+ */
+export function isCopilotVendor(vendor: string): boolean {
+  return (vendor || "").trim().toLowerCase() === "copilot";
+}
+
 export function classifyModelBillability(
   calculator: AICCalculator,
   config: AICConfig,
@@ -987,9 +1030,12 @@ export function classifyModelBillability(
   hasActualCredits: boolean,
   catalogLookup?: CatalogLookup,
   sourceHint?: string,
+  recordedVendor?: string,
 ): boolean {
   const lower = (modelName || "").toLowerCase();
-  const isCopilotRouted = isCopilotSourceHint(sourceHint) || isCopilotResolvedModelId(modelName);
+  const vendor = (recordedVendor || "").trim().toLowerCase();
+  const isCopilotRouted =
+    isCopilotVendor(vendor) || isCopilotSourceHint(sourceHint) || isCopilotResolvedModelId(modelName);
   const viaByokWrapper = isByokWrapperCall(sourceHint);
 
   // 1. Explicit exclude wins over everything else (lets the user mark a
@@ -1017,13 +1063,23 @@ export function classifyModelBillability(
     return true;
   }
 
-  // 4b. Per-request routing evidence. When the id is declared under a
+  // 4a. Observed routing beats every inference below. VS Code stamps the
+  //     dispatching vendor on each request's `modelId`
+  //     (`customendpoint/Azure OAI/claude-opus-5`), so a colliding id needs no
+  //     guesswork: a non-Copilot vendor means the user's own key paid for it.
+  //     Requests GitHub actually billed already returned at step 2, so this
+  //     can never contradict a real credit figure.
+  if (vendor && !isCopilotVendor(vendor)) {
+    return false;
+  }
+
+  // 4b. Fallback routing evidence for turns with no recorded vendor (legacy
+  //     sessions, debug-log-only rows). When the id is declared under a
   //     non-Copilot vendor AND this particular request went out through the
   //     public LanguageModelChat wrapper, a BYOK provider served it — even if
   //     Copilot's CAPI also sells the same id. This is what splits a colliding
   //     model (`claude-opus-5`) into its billed and unbilled halves instead of
-  //     forcing the whole row one way. Requests that carried real credits
-  //     already returned at step 2.
+  //     forcing the whole row one way.
   if (viaByokWrapper && catalogLookup?.(modelName)?.userThirdParty === true) {
     return false;
   }

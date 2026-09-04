@@ -9,6 +9,7 @@ images/icon.svg
 images/icon-512.png
 .history
 copilot_all_tools.jsonl
+.agent_workspace/**
 **/*.ts
 **/*.map
 **/*.vsix

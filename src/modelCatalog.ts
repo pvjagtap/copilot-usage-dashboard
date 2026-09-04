@@ -113,8 +113,15 @@ const CATALOG_CACHE_KEY = "copilotUsage.aic.modelCatalog.v1";
  *   2 — also reads the documented `models[]` array, and keeps ids declared
  *       under several non-Copilot vendors as `"multiple"` instead of
  *       dropping them.
+ *   3 — stops reading `settings` keys as a vendor declaration. They are
+ *       per-model option overrides that VS Code writes under the Copilot
+ *       entry even for BYOK models, so a v2 map wrongly saw every configured
+ *       BYOK id as a Copilot/BYOK collision and dropped it as ambiguous.
+ *
+ * Exported so fixtures can seed a current-schema snapshot instead of pinning
+ * a literal that silently turns every bump into a false test failure.
  */
-const VENDOR_MAP_VERSION = 2;
+export const VENDOR_MAP_VERSION = 3;
 
 /**
  * globalState key for the account-scoped part of the catalog (CAPI rates +

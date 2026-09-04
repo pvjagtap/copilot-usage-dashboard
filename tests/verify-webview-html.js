@@ -33,7 +33,7 @@ console.log('Largest template literal (raw source):', rawTemplate.length, 'chars
 let html;
 try {
   const stubbed = rawTemplate.replace(/\$\{[^{}]*\}/g, '{}');
-  // eslint-disable-next-line no-new-func
+   
   html = new Function('return `' + stubbed + '`')();
 } catch (e) {
   console.log('FAIL: outer template literal is not valid JS —', e.message);
@@ -49,7 +49,7 @@ while ((m = scriptRe.exec(html)) !== null) {
   count++;
   const body = m[1];
   try {
-    // eslint-disable-next-line no-new-func
+     
     new Function(body);
     console.log('  Inline script #' + count + ': PARSE OK (' + body.length + ' chars)');
   } catch (e) {

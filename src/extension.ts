@@ -1,13 +1,12 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
-import * as path from "path";
 import { OTelReceiver } from "./otelReceiver";
 import { StatusBarProvider, CurrentSessionInfo } from "./statusBar";
 import { DashboardPanel } from "./dashboardPanel";
 import { scanWorkspaceStorage, ScanResult, getWorkspaceStoragePath, setProjectNameHints } from "./scanner";
 import { scanAgentSessions, AgentScanResult } from "./agentScanner";
 import { scanCliSessions, CliScanResult } from "./cliScanner";
-import { buildDashboardData, DashboardData, AIC_EFFECTIVE_DATE } from "./dashboardData";
+import { buildDashboardData, DashboardData, TtlAnchor, AIC_EFFECTIVE_DATE } from "./dashboardData";
 import { SidebarViewProvider } from "./sidebarView";
 import { buildSidebarSnapshot } from "./sidebarSnapshot";
 import { AICConfig, DEFAULT_AIC_CONFIG, createCalculatorFromConfig } from "./aicCredits";
@@ -20,9 +19,11 @@ import { LimitOverlay } from "./limitOverlay";
 import { Enforcement } from "./enforcement";
 import { HookManager } from "./hookManager";
 import { detectAndApplyPlan, resetPlanDetection } from "./planDetector";
+import { fetchQuotaSnapshot, getCachedQuotaSnapshot } from "./quotaSnapshot";
 import { loadCatalog as loadModelCatalog } from "./modelCatalog";
 import { registerSyncKeys, publishAndRead, combinedCredits } from "./machineSync";
 import { computeCacheHit } from "./cache";
+import { TtlTracker, getTtlConfig } from "./ttlTracker";
 
 const OTEL_PORT = 14318;
 /**
@@ -70,6 +71,9 @@ let cachedDashData: DashboardData | undefined;
 let extCtx: vscode.ExtensionContext | undefined;
 let lastOtelRequests = 0;
 let otelDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Prompt-cache TTL subsystem. Data-only — it never performs its own I/O. */
+let ttlTracker: TtlTracker | undefined;
 
 /** Daily-limit subsystem */
 let limitTracker: DailyLimitTracker | undefined;
@@ -128,7 +132,10 @@ function buildData(): DashboardData {
     },
   };
   const aicConfig = getAICConfig();
-  cachedDashData = buildDashboardData(scan, otelStats, aicConfig, lastAgentScan, activationTime, lastCliScan);
+  const byokPricing = vscode.workspace
+    .getConfiguration("copilotUsage")
+    .get<Record<string, unknown>>("byokPricing");
+  cachedDashData = buildDashboardData(scan, otelStats, aicConfig, lastAgentScan, activationTime, lastCliScan, getCachedQuotaSnapshot(), byokPricing);
 
   // Publish this machine's rollup and fold in whatever other systems have
   // synced. Rollups only — never raw sessions, prompts or log contents.
@@ -161,7 +168,59 @@ function buildData(): DashboardData {
       `buildData took ${elapsed}ms (${scan.stats.turnsStored} turns, ${scan.stats.canonicalSessions} sessions)`
     );
   }
+  // Refreshed on every call, including cache hits — the anchors are cheap and
+  // must not go stale behind the memoized dashboard payload.
+  cachedDashData.ttlBySession = buildTtlAnchors();
   return cachedDashData;
+}
+
+/**
+ * The standalone `SukumarP.cache-timer` extension watches the same debug-logs
+ * and renders its own countdown. Running both means two status-bar timers over
+ * identical data, so warn once and leave the choice to the user.
+ */
+function warnOnCacheTimerConflict(context: vscode.ExtensionContext): void {
+  const KEY = "cacheTimerConflictNotified";
+  if (context.globalState.get<boolean>(KEY)) {
+    return;
+  }
+  if (!vscode.extensions.getExtension("SukumarP.cache-timer")) {
+    return;
+  }
+  void context.globalState.update(KEY, true);
+  void vscode.window
+    .showInformationMessage(
+      "Copilot Usage now tracks prompt-cache TTL natively. The separate \u201cCache TTL Timer\u201d extension will show a duplicate countdown.",
+      "Show Extension",
+      "Dismiss"
+    )
+    .then(choice => {
+      if (choice === "Show Extension") {
+        void vscode.commands.executeCommand(
+          "workbench.extensions.search",
+          "@installed SukumarP.cache-timer"
+        );
+      }
+    });
+}
+
+/** sessionId → countdown anchor for the dashboard's live Cache TTL column. */
+function buildTtlAnchors(): Record<string, TtlAnchor> {
+  const out: Record<string, TtlAnchor> = {};
+  for (const s of ttlTracker?.getSessions() ?? []) {
+    if (s.source !== "vscode") {
+      continue;
+    }
+    out[s.sessionId] = {
+      lastRequestMs: s.lastRequestMs,
+      timerValue: s.timerValue,
+      warnAt: s.warnAt,
+      alertAt: s.alertAt,
+      working: s.working,
+      provider: s.provider,
+    };
+  }
+  return out;
 }
 
 /**
@@ -226,7 +285,12 @@ async function runScan(): Promise<void> {
     lastScan = scanResult;
     lastAgentScan = agentResult;
     lastCliScan = cliResult;
+    // GitHub's own credit ledger. Local logs are only ever a lower bound, so
+    // this is what keeps the headline from drifting below github.com.
+    await fetchQuotaSnapshot(msg => output.appendLine(msg));
     cachedDashData = undefined; // Invalidate cache
+    // Data-only refresh of the cache countdown anchors — no extra file I/O.
+    ttlTracker?.ingest(lastScan, lastCliScan);
     const elapsed = Date.now() - t0;
     output.appendLine(
       `Scan: ${lastScan.stats.canonicalSessions} sessions, ${lastScan.stats.turnsStored} turns, ` +
@@ -476,6 +540,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBar = new StatusBarProvider("copilotUsage.openDashboard");
   context.subscriptions.push({ dispose: () => statusBar?.dispose() });
 
+  // ── Prompt-cache TTL subsystem ─────────────────────────────
+  ttlTracker = new TtlTracker(
+    vscode.Uri.joinPath(context.extensionUri, "media", "alert.wav").fsPath,
+    () => getAICConfig().overageCostPerCredit ?? 0.01
+  );
+  context.subscriptions.push(ttlTracker);
+  // Repaint on every tick so the countdown is live, not just on scan.
+  context.subscriptions.push(
+    ttlTracker.onChange(() => {
+      statusBar?.refreshTtl(ttlTracker?.getSessions() ?? []);
+      pushSidebarSnapshot();
+    })
+  );
+  // A hidden window has nothing to animate — pause the tick entirely.
+  ttlTracker.setUiVisible(vscode.window.state.focused);
+  context.subscriptions.push(
+    vscode.window.onDidChangeWindowState(st => ttlTracker?.setUiVisible(st.focused)),
+    vscode.commands.registerCommand("copilotUsage.cacheTtl.toggle", async () => {
+      const cfg = vscode.workspace.getConfiguration("copilotUsage.cacheTtl");
+      const next = !(cfg.get<boolean>("enabled") ?? false);
+      await cfg.update("enabled", next, vscode.ConfigurationTarget.Global);
+      output.appendLine(`Cache TTL tracking ${next ? "enabled" : "disabled"}.`);
+      void vscode.window.showInformationMessage(
+        `Copilot Usage: prompt-cache TTL tracking ${next ? "enabled" : "disabled"}.`
+      );
+    })
+  );
+  warnOnCacheTimerConflict(context);
+
   // ── Daily limit subsystem ──────────────────────────────────
   limitTracker = new DailyLimitTracker(context);
   limitOverlay = new LimitOverlay(context.extensionUri);
@@ -580,9 +673,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           void hookManager?.uninstall();
         }
       }
+      if (e.affectsConfiguration("copilotUsage.cacheTtl")) {
+        ttlTracker?.onConfigChanged();
+        ttlTracker?.ingest(lastScan, lastCliScan);
+      }
       if (
         e.affectsConfiguration("copilotUsage.dailyLimit") ||
-        e.affectsConfiguration("copilotUsage.aic")
+        e.affectsConfiguration("copilotUsage.aic") ||
+        e.affectsConfiguration("copilotUsage.cacheTtl")
       ) {
         updateStatusBar();
       }
@@ -928,6 +1026,7 @@ function updateStatusBar(): void {
 
   const aicConfig = getAICConfig();
   const calculator = createCalculatorFromConfig(aicConfig);
+  const ttlCfg = getTtlConfig();
   const AIC_START = AIC_EFFECTIVE_DATE;
 
   // SOURCE OF TRUTH for AIC: `dashData.liveOtel` — the same numbers the
@@ -1041,6 +1140,9 @@ function updateStatusBar(): void {
     cycleCacheHitPct: computeCycleCacheHit(dashData),
     liveSessionPrompt: dashData.liveOtel.prompt,
     liveSessionCached: dashData.liveOtel.cached,
+    ttlSessions: ttlTracker?.getSessions() ?? [],
+    ttlShowInStatusBar: ttlCfg.enabled && ttlCfg.showInStatusBar,
+    ttlMaxSessions: ttlCfg.maxSessions,
   });
 
   // Stash current-session metadata for the sidebar (model / turns / duration).
@@ -1086,6 +1188,7 @@ function pushSidebarSnapshot(precomputed?: DashboardData): void {
       currentSessionTurns: lastCurrentSession?.turns ?? 0,
       currentSessionDurationMin: lastCurrentSession?.durationMin ?? 0,
       activationTime,
+      ttlSessions: ttlTracker?.getSessions() ?? [],
     });
     sidebarProvider.postSnapshot(snap);
   } catch (err) {

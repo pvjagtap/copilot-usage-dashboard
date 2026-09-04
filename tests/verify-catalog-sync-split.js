@@ -186,19 +186,20 @@ refreshCases.push(async () => {
   catalog.loadCatalog(makeCtx(seed), { enabled: true, log });
   check("pre-v2 vendor map forces a refresh despite a fresh TTL", refreshed);
 
-  // The old entries are a strict subset of what v2 produces, so they must
-  // still answer while the refresh is in flight.
+  // The old entries are a strict subset of what a current parser produces, so
+  // they must still answer while the refresh is in flight.
   const hit = catalog.classifyByCatalog("llama3");
   check("pre-v2 entries still classify during the refresh",
     !!hit && hit.billable === false && hit.vendor === "ollama",
     JSON.stringify(hit));
   await settle();
 
-  // A current map must NOT force a refresh.
+  // A current map must NOT force a refresh. Track the live constant so a
+  // schema bump doesn't turn this into a false failure.
   let refreshed2 = false;
   global.fetch = async () => { refreshed2 = true; throw new Error("offline"); };
   const seed2 = {
-    [LOCAL_KEY]: { ...seed[LOCAL_KEY], vendorMapVersion: 2 },
+    [LOCAL_KEY]: { ...seed[LOCAL_KEY], vendorMapVersion: catalog.VENDOR_MAP_VERSION },
     [SYNC_KEY]: seed[SYNC_KEY],
   };
   catalog.loadCatalog(makeCtx(seed2), { enabled: true, log });

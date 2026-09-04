@@ -26,6 +26,15 @@ export interface Session {
   lastTimestamp: string;
   modelName: string;
   modelFamily: string;
+  /**
+   * Vendor VS Code itself recorded for the dispatched model (`copilot`,
+   * `customendpoint`, `ollama`, …). Unlike the vendor map derived from
+   * `chatLanguageModels.json`, this is observed routing evidence, so it
+   * resolves ids sold by BOTH Copilot and a BYOK key. "" when unknown.
+   */
+  modelVendor: string;
+  /** BYOK provider display name from the model identifier, e.g. `Azure OAI`. */
+  modelProvider: string;
   modelMultiplier: number;
   accountLabel: string;
   agentId: string;
@@ -45,6 +54,18 @@ export interface Session {
   sourcePaths: string[];
   transcriptPaths: string[];
   debugLogPath: string;
+  /**
+   * Epoch-ms activity markers from debug-logs, used ONLY by the prompt-cache
+   * TTL tracker (src/ttlTracker.ts). Deliberately excluded from every token
+   * and credit summation path — adding them must never move an AIC number.
+   * 0 when the session has no debug-log.
+   */
+  lastTurnStartMs: number;
+  lastTurnEndMs: number;
+  /** Epoch ms of the newest `llm_request` across main + child logs. */
+  lastRequestMs: number;
+  /** `attrs.model` of that newest `llm_request` — drives TTL provider mapping. */
+  lastRequestModel: string;
 }
 
 export interface Turn {
@@ -52,6 +73,18 @@ export interface Turn {
   turnIndex: number;
   timestamp: string;
   modelFamily: string;
+  /**
+   * Vendor VS Code recorded on THIS turn's `modelId` — the per-request
+   * routing fact that decides billability for a colliding id. Only applies
+   * to requests whose model equals `modelFamily`; auxiliary calls in the same
+   * turn (title generation, subagents) run on their own route.
+   */
+  modelVendor?: string;
+  /**
+   * Provider display name from the same identifier (`Azure Foundry Anthropic`).
+   * Empty for Copilot and for providers that record no name.
+   */
+  modelProvider?: string;
   promptTokens: number;
   outputTokens: number;
   /** Actual cumulative input tokens from debug-logs (sum of all LLM API calls in this turn). */
@@ -239,24 +272,76 @@ function extractSubagentArgs(rawArgs: unknown): { agentName: string; description
  * Caller is responsible for resolving turnIndex, timestamp and workspaceName
  * because each branch derives them from different fields.
  */
+/**
+ * Split a VS Code chat model identifier into its parts.
+ *
+ * Shapes seen on disk (verified across every local chatSession):
+ *   `copilot/claude-opus-5`
+ *   `customendpoint/Azure Foundry Anthropic/claude-opus-5`
+ *   `claude-opus-5`                       (legacy, no vendor recorded)
+ *
+ * The vendor is the FIRST segment and the model id the LAST; anything between
+ * them is the provider's display name.
+ */
+export function splitModelIdentifier(raw: string): {
+  model: string;
+  vendor: string;
+  provider: string;
+} {
+  const parts = (raw || "").split("/").filter(p => p.length > 0);
+  if (parts.length === 0) {
+    return { model: "", vendor: "", provider: "" };
+  }
+  if (parts.length === 1) {
+    return { model: parts[0], vendor: "", provider: "" };
+  }
+  return {
+    model: parts[parts.length - 1],
+    vendor: parts[0].toLowerCase(),
+    provider: parts.slice(1, -1).join("/"),
+  };
+}
+
+/**
+ * Human-readable name for who served a request.
+ *
+ * `vendor` is VS Code's provider *mechanism*, so for a Custom Endpoint it is
+ * the literal string `customendpoint` — true but meaningless to a reader. The
+ * identifier's middle segment holds the name the user actually typed
+ * ("Azure Foundry Anthropic"), so prefer it and fall back to the vendor only
+ * when no name was recorded.
+ */
+export function providerLabel(vendor: string, provider: string): string {
+  const name = (provider || "").trim();
+  if (name) {
+    return name;
+  }
+  return (vendor || "").trim();
+}
+
 function emitTurnAndToolCalls(
   meta: Record<string, unknown>,
   ctx: {
     sessionId: string;
     turnIndex: number;
     modelFamily: string;
+    modelVendor?: string;
+    modelProvider?: string;
     timestamp: string;
     workspaceName: string;
   },
   out: { turns: Turn[]; toolCalls: ToolCall[]; subagents: Subagent[] }
 ): void {
-  const { sessionId, turnIndex, modelFamily, timestamp, workspaceName } = ctx;
+  const { sessionId, turnIndex, modelFamily, modelVendor, modelProvider, timestamp, workspaceName } =
+    ctx;
 
   out.turns.push({
     sessionId,
     turnIndex,
     timestamp,
     modelFamily,
+    modelVendor,
+    modelProvider,
     promptTokens: num(meta, "promptTokens"),
     outputTokens: num(meta, "outputTokens"),
     debugPromptTokens: 0,
@@ -386,6 +471,8 @@ function parseSessionContent(
   let sessionTitle = "";
   let modelName = "unknown";
   let modelFamily = "unknown";
+  let modelVendor = "";
+  let modelProvider = "";
   let modelMultiplier = 1;
   let accountLabel = "";
   let firstTimestamp = "";
@@ -451,6 +538,8 @@ function parseSessionContent(
 
       const sel = get(v, "inputState", "selectedModel");
       if (isObj(sel)) {
+        const ident =
+          typeof sel.identifier === "string" ? splitModelIdentifier(sel.identifier) : null;
         const meta = sel.metadata;
         if (isObj(meta)) {
           modelName =
@@ -462,9 +551,15 @@ function parseSessionContent(
           modelFamily = typeof meta.family === "string" ? meta.family : "unknown";
           modelMultiplier = typeof meta.multiplierNumeric === "number" ? meta.multiplierNumeric : 0;
           accountLabel = str(meta, "auth", "accountLabel");
+          // `metadata.vendor` is the same value the identifier encodes; prefer
+          // it because it survives provider names that contain a slash.
+          modelVendor =
+            typeof meta.vendor === "string" ? meta.vendor.toLowerCase() : (ident?.vendor ?? "");
         } else {
           modelName = typeof sel.identifier === "string" ? sel.identifier : "unknown";
+          modelVendor = ident?.vendor ?? "";
         }
+        modelProvider = ident?.provider ?? "";
       }
 
       // New format: kind=0 v.requests[] contains embedded turn results
@@ -498,7 +593,15 @@ function parseSessionContent(
 
             emitTurnAndToolCalls(
               meta,
-              { sessionId, turnIndex: ri, modelFamily, timestamp, workspaceName: wName },
+              {
+                sessionId,
+                turnIndex: ri,
+                modelFamily,
+                modelVendor: modelVendor || undefined,
+                modelProvider: modelProvider || undefined,
+                timestamp,
+                workspaceName: wName,
+              },
               { turns, toolCalls, subagents }
             );
           } else {
@@ -516,6 +619,8 @@ function parseSessionContent(
                 turnIndex: ri,
                 timestamp: ts,
                 modelFamily,
+                modelVendor: modelVendor || undefined,
+                modelProvider: modelProvider || undefined,
                 promptTokens: 0,
                 outputTokens: 0,
                 debugPromptTokens: 0,
@@ -589,7 +694,15 @@ function parseSessionContent(
 
       emitTurnAndToolCalls(
         meta,
-        { sessionId, turnIndex, modelFamily, timestamp, workspaceName: wName },
+        {
+          sessionId,
+          turnIndex,
+          modelFamily,
+          modelVendor: modelVendor || undefined,
+          modelProvider: modelProvider || undefined,
+          timestamp,
+          workspaceName: wName,
+        },
         { turns, toolCalls, subagents }
       );
       continue;
@@ -634,12 +747,22 @@ function parseSessionContent(
         agentId = reqAgent;
       }
 
-      // `copilot/claude-opus-5` → `claude-opus-5`.
+      // `copilot/claude-opus-5` → model `claude-opus-5`, vendor `copilot`.
+      // The vendor prefix is the per-request routing fact; keep it rather
+      // than discarding it with the rest of the prefix.
+      let turnVendor = modelVendor;
+      let turnProvider = modelProvider;
       const rawModel = typeof req.modelId === "string" ? req.modelId : "";
       if (rawModel) {
-        const bare = rawModel.includes("/") ? rawModel.slice(rawModel.lastIndexOf("/") + 1) : rawModel;
-        modelName = bare;
-        modelFamily = bare;
+        const ident = splitModelIdentifier(rawModel);
+        modelName = ident.model;
+        modelFamily = ident.model;
+        if (ident.vendor) {
+          modelVendor = ident.vendor;
+          modelProvider = ident.provider;
+          turnProvider = ident.provider;
+        }
+        turnVendor = ident.vendor || modelVendor;
       }
 
       const completedAt = num(isObj(req.modelState) ? req.modelState : {}, "completedAt");
@@ -662,6 +785,8 @@ function parseSessionContent(
         turnIndex: ri,
         timestamp,
         modelFamily,
+        modelVendor: turnVendor || undefined,
+        modelProvider: turnProvider || undefined,
         promptTokens: prompt,
         outputTokens: completion,
         debugPromptTokens: 0,
@@ -758,6 +883,8 @@ function parseSessionContent(
       lastTimestamp,
       modelName,
       modelFamily,
+      modelVendor,
+      modelProvider,
       modelMultiplier,
       accountLabel,
       agentId,
@@ -774,6 +901,10 @@ function parseSessionContent(
       sourcePaths: [filePath],
       transcriptPaths: [],
       debugLogPath: "",
+      lastTurnStartMs: 0,
+      lastTurnEndMs: 0,
+      lastRequestMs: 0,
+      lastRequestModel: "",
     },
     turns,
     toolCalls,
@@ -1234,6 +1365,11 @@ interface DebugLogData {
   totalNanoAiu: number;
   /** Individual llm_request records across this debug-log directory. */
   requests: DebugRequest[];
+  /** TTL-only activity markers (epoch ms). Never feed token/credit sums. */
+  lastTurnStartMs: number;
+  lastTurnEndMs: number;
+  lastRequestMs: number;
+  lastRequestModel: string;
 }
 
 /**
@@ -1258,6 +1394,11 @@ interface ParsedDebugLog {
   byModel: Map<string, DebugModelTotals>;
   /** Individual llm_request records across this file. */
   requests: DebugRequest[];
+  /** TTL-only activity markers (epoch ms). Never feed token/credit sums. */
+  lastTurnStartMs: number;
+  lastTurnEndMs: number;
+  lastRequestMs: number;
+  lastRequestModel: string;
 }
 
 function parseDebugLogLines(content: string): ParsedDebugLog | null {
@@ -1279,6 +1420,10 @@ function parseDebugLogLines(content: string): ParsedDebugLog | null {
   // per-model attribution.
   const sessionByModel = new Map<string, DebugModelTotals>();
   const sessionRequests: DebugRequest[] = [];
+  let lastTurnStartMs = 0;
+  let lastTurnEndMs = 0;
+  let lastRequestMs = 0;
+  let lastRequestModel = "";
 
   for (const line of lines) {
     let entry: unknown;
@@ -1311,9 +1456,19 @@ function parseDebugLogLines(content: string): ParsedDebugLog | null {
       const tid = get(entry, "attrs", "turnId");
       const parsed = tid !== undefined ? parseInt(String(tid), 10) : NaN;
       currentTurn = Number.isNaN(parsed) ? currentTurn + 1 : parsed;
+      const ts = typeof entry.ts === "number" ? entry.ts : 0;
+      if (ts > lastTurnStartMs) {
+        lastTurnStartMs = ts;
+      }
       if (!turnMap.has(currentTurn)) {
-        const ts = typeof entry.ts === "number" ? entry.ts : 0;
         turnMap.set(currentTurn, emptyDebugTurn(currentTurn, ts));
+      }
+    } else if (type === "turn_end") {
+      // TTL-only: an open turn (start > end) means the agent is still
+      // generating, so the prompt cache is being refreshed (HOT state).
+      const ts = typeof entry.ts === "number" ? entry.ts : 0;
+      if (ts > lastTurnEndMs) {
+        lastTurnEndMs = ts;
       }
     } else if (type === "llm_request") {
       const attrs = entry.attrs;
@@ -1353,6 +1508,10 @@ function parseDebugLogLines(content: string): ParsedDebugLog | null {
       totalNanoAiu += nanoAiu;
       totalLlmCalls++;
       sessionRequests.push(debugRequest);
+      if (eventTs > lastRequestMs) {
+        lastRequestMs = eventTs;
+        lastRequestModel = reqModel;
+      }
       // Session-level per-model accumulation (covers pre-turn requests too).
       const sm = sessionByModel.get(reqModel) ?? emptyModelTotals();
       sm.prompt += inp;
@@ -1411,14 +1570,21 @@ function parseDebugLogLines(content: string): ParsedDebugLog | null {
     childLogFiles,
     byModel: sessionByModel,
     requests: sessionRequests,
+    lastTurnStartMs,
+    lastTurnEndMs,
+    lastRequestMs,
+    lastRequestModel,
   };
 }
 
 /**
  * Parse a debug-log session directory: reads main.jsonl and follows all
  * child_session_ref entries (subagent logs, title logs) to aggregate total usage.
+ *
+ * Exported so `tests/verify-ttl-from-scan.js` can assert the prompt-cache TTL
+ * markers against a real on-disk log tree without re-implementing the parser.
  */
-async function parseDebugLogDir(sessionDir: string): Promise<DebugLogData | null> {
+export async function parseDebugLogDir(sessionDir: string): Promise<DebugLogData | null> {
   const mainJsonl = path.join(sessionDir, "main.jsonl");
   let mainContent: string;
   try {
@@ -1438,6 +1604,8 @@ async function parseDebugLogDir(sessionDir: string): Promise<DebugLogData | null
   let totalLlmCalls = main.totalLlmCalls;
   let totalNanoAiu = main.totalNanoAiu;
   const requests = main.requests.slice();
+  let lastRequestMs = main.lastRequestMs;
+  let lastRequestModel = main.lastRequestModel;
 
   // Older Copilot versions (and some session boundary conditions) leave
   // `title-*.jsonl` and `runSubagent-*.jsonl` on disk WITHOUT a matching
@@ -1486,6 +1654,11 @@ async function parseDebugLogDir(sessionDir: string): Promise<DebugLogData | null
       totalLlmCalls += child.totalLlmCalls;
       totalNanoAiu += child.totalNanoAiu;
       requests.push(...child.requests);
+      // Subagent/title rounds refresh the same prompt cache — take the newest.
+      if (child.lastRequestMs > lastRequestMs) {
+        lastRequestMs = child.lastRequestMs;
+        lastRequestModel = child.lastRequestModel;
+      }
 
       // Merge child credits into the parent turn that spawned it. The
       // `title-*.jsonl` child fires BEFORE any `turn_start` (parentTurn === -1)
@@ -1536,6 +1709,10 @@ async function parseDebugLogDir(sessionDir: string): Promise<DebugLogData | null
     totalLlmCalls,
     totalNanoAiu,
     requests,
+    lastTurnStartMs: main.lastTurnStartMs,
+    lastTurnEndMs: main.lastTurnEndMs,
+    lastRequestMs,
+    lastRequestModel,
   };
 }
 
@@ -1753,6 +1930,10 @@ export async function scanWorkspaceStorage(workspaceStorageOverride?: string): P
     s.debugTotalOutput = dbg.totalOutput;
     s.debugTotalAicCredits = dbg.totalNanoAiu / 1_000_000_000;
     s.debugLogPath = dbg.filePath;
+    s.lastTurnStartMs = dbg.lastTurnStartMs;
+    s.lastTurnEndMs = dbg.lastTurnEndMs;
+    s.lastRequestMs = dbg.lastRequestMs;
+    s.lastRequestModel = dbg.lastRequestModel;
 
     // Enrich individual turns + create synthetic turns for unmatched debug-log entries
     for (const dt of dbg.turns) {
@@ -1796,6 +1977,8 @@ export async function scanWorkspaceStorage(workspaceStorageOverride?: string): P
           turnIndex: dt.turnIndex,
           timestamp: ts,
           modelFamily: s.modelFamily || "unknown",
+          modelVendor: s.modelVendor || undefined,
+          modelProvider: s.modelProvider || undefined,
           promptTokens: 0,
           outputTokens: 0,
           debugPromptTokens: dt.promptTotal,

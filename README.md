@@ -19,6 +19,47 @@ code --install-extension copilot-usage-dashboard-*.vsix
 
 Command Palette → `Copilot Usage: Open Dashboard`
 
+## Prompt-cache TTL
+
+A cached prompt prefix is re-read at a fraction of the input rate, but providers
+expire it after a few minutes of inactivity — and once it lapses the whole
+conversation is re-billed in full. On a long agent session that is the
+difference between a few credits and a few hundred.
+
+Enable `copilotUsage.cacheTtl.enabled` to get a live countdown of how long each
+session's cache stays warm, in the status bar, its tooltip, the sidebar, and the
+sessions table. Sessions still generating show `HOT` instead of a countdown.
+
+Lifetimes are per-provider under `copilotUsage.cacheTtl.ttl`. Only Anthropic
+documents a TTL (~5 min), so treat the rest as tunable estimates rather than
+billing guarantees.
+
+## BYOK provider cost
+
+Requests through your own endpoint — Azure AI Foundry, Anthropic, OpenAI, a
+local Ollama — are not billed by GitHub. They appear in the non-billable panel,
+where the credit columns show only what the traffic *would* have cost on
+Copilot: a figure on no invoice you actually receive.
+
+The **Provider cost** column applies your provider's real per-token rates to the
+same traffic and reports USD. It is a different vendor's bill, so it is reported
+separately and never added to your AI credits.
+
+Anthropic-family rates ship as defaults at published Claude API prices, which
+Anthropic documents as also being the Microsoft Foundry rate card. Override
+anything under `copilotUsage.byokPricing`, including `regionMultiplier` for
+Azure US Data Zone deployments (`1.1x`; Global Standard is `1.0x`).
+
+Two limits worth knowing:
+
+- A model with **no configured rate shows `—`, never `$0.00`.** An unpriced
+  Azure deployment and a genuinely free local model must not look identical.
+- The total is a **lower bound.** Anthropic charges `0.1x` for cache reads and
+  `1.25x`–`2.0x` for cache writes, but VS Code records one undifferentiated
+  `cached` count. Cached tokens are priced as reads;
+  `copilotUsage.byokPricing.cacheWriteRatio` shifts the split if your workload
+  writes more than it reads.
+
 ## Configure
 
 Settings → search `copilotUsage`.
@@ -31,10 +72,14 @@ Common settings:
 | `copilotUsage.aic.overageCostPerCredit` | `0.01`     | USD per AI credit                      |
 | `copilotUsage.dailyLimit.enabled`       | `false`    | Opt in to the daily spend guard        |
 | `copilotUsage.dailyLimit.dollars`       | `0`        | Daily USD cap (0 = use credit cap)     |
+| `copilotUsage.cacheTtl.enabled`         | `false`    | Opt in to the prompt-cache countdown   |
+| `copilotUsage.byokPricing`              | built-ins  | Your own provider's per-token rates    |
 | `copilotUsage.workspaceStoragePath`     | auto       | Override VS Code workspaceStorage root |
 
 Full configuration reference, data sources, and internals: [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ## License
 
-MIT
+MIT. Portions of the prompt-cache TTL feature are derived from
+[cache-timer](https://github.com/sukumarp2022/cache-timer) (MIT © 2026
+sukumarp2022) — see [NOTICE](NOTICE).

@@ -43,7 +43,7 @@ globalThis.fetch = async () => {
   throw new Error("network disabled in test");
 };
 
-const { loadCatalog, notifyUnknownModel } = require(path.join(OUT, "modelCatalog.js"));
+const { loadCatalog, notifyUnknownModel, VENDOR_MAP_VERSION } = require(path.join(OUT, "modelCatalog.js"));
 
 let failed = 0;
 function ok(label, cond, extra) {
@@ -75,9 +75,10 @@ function ctxWithSnapshotAge(ageMs) {
     ],
     cdnProviders: {},
     userVendorByModelId: [],
-    // Current schema — otherwise the upgrade path forces a refresh and these
-    // cases can't isolate TTL/miss behaviour.
-    vendorMapVersion: 2,
+    // Track the live constant: pinning a literal turns every schema bump into
+    // a false failure here, because the upgrade path would force a refresh and
+    // these cases can't then isolate TTL/miss behaviour.
+    vendorMapVersion: VENDOR_MAP_VERSION,
   };
   return { globalState: { get: () => payload, update: async () => {} } };
 }

@@ -1,7 +1,26 @@
 const assert = require("assert");
 const path = require("path");
+const fs = require("fs");
+const Module = require("module");
 
 const ROOT = path.resolve(__dirname, "..");
+
+// `dashboardData` reaches `modelCatalog`, which imports `vscode`. Point that
+// specifier at the shared stub the other suites use, or the require chain dies
+// before a single assertion runs.
+const stubPath = path.join(__dirname, "_vscode-stub.js");
+if (!fs.existsSync(stubPath)) {
+  fs.writeFileSync(
+    stubPath,
+    "module.exports = { workspace: { getConfiguration: () => ({ get: () => undefined, update: async () => {} }) }, window: {}, commands: {}, Uri: { file: (p) => ({ fsPath: p, toString: () => p }) }, ConfigurationTarget: { Global: 1 }, EventEmitter: class { constructor(){ this.event = () => ({ dispose(){} }); } fire(){} dispose(){} } };\n"
+  );
+}
+const origResolve = Module._resolveFilename;
+Module._resolveFilename = function (request, parent, ...rest) {
+  if (request === "vscode") return stubPath;
+  return origResolve.call(this, request, parent, ...rest);
+};
+
 const { buildDashboardData } = require(path.join(ROOT, "out", "dashboardData.js"));
 const { DEFAULT_AIC_CONFIG } = require(path.join(ROOT, "out", "aicCredits.js"));
 

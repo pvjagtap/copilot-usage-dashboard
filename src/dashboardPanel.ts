@@ -228,18 +228,19 @@ td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .sessions-scroll::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 
 /* ===== Redesign: hero cards, tabs, expanders, captions ===== */
-.hero-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 8px; margin-bottom: 10px; }
-.hero-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px 10px 16px; position: relative; overflow: hidden;
-  display: grid; grid-template-columns: minmax(0, 1fr) minmax(140px, 42%); column-gap: 14px; align-items: center; }
+.hero-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; margin-bottom: 10px; }
+.hero-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 7px 12px 7px 14px; position: relative; overflow: hidden;
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 40%); column-gap: 12px; align-items: center; }
 .hero-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--blue); border-radius: 10px 0 0 10px; }
 .hero-card.accent-orange::before { background: var(--orange); }
+.hero-card.accent-blue::before { background: var(--blue); }
 .hero-card.accent-green::before { background: var(--green); }
 .hero-card.accent-purple::before { background: var(--purple); }
 .hero-card.accent-red::before { background: var(--red); }
-.hero-card .h-label { grid-column: 1; grid-row: 1; font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; font-weight: 700; white-space: normal; word-break: break-word; text-align: left; }
-.hero-card .h-value { grid-column: 2; grid-row: 1 / -1; align-self: center; justify-self: stretch; text-align: center; font-size: 26px; font-weight: 700; line-height: 1.1; letter-spacing: -0.3px; white-space: nowrap; }
-.hero-card .h-sub   { grid-column: 1; grid-row: 2; font-size: 11px; color: var(--muted); font-weight: 500; white-space: normal; word-break: break-word; text-align: left; margin-top: 2px; }
-.hero-card .h-delta { grid-column: 1; grid-row: 3; justify-self: start; display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 10px; margin-top: 4px; }
+.hero-card .h-label { grid-column: 1; grid-row: 1; font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.4px; font-weight: 700; white-space: normal; word-break: break-word; text-align: left; }
+.hero-card .h-value { grid-column: 2; grid-row: 1 / -1; align-self: center; justify-self: stretch; text-align: center; font-size: 23px; font-weight: 700; line-height: 1.05; letter-spacing: -0.3px; white-space: nowrap; }
+.hero-card .h-sub   { grid-column: 1; grid-row: 2; font-size: 10px; line-height: 1.3; color: var(--muted); font-weight: 500; white-space: normal; word-break: break-word; text-align: left; margin-top: 1px; }
+.hero-card .h-delta { grid-column: 1; grid-row: 3; justify-self: start; display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 9px; margin-top: 3px; }
 .h-delta.up { background: var(--pill-green-bg); color: var(--green); border: 1px solid var(--pill-green-border); }
 .h-delta.down { background: var(--pill-blue-bg); color: var(--blue); border: 1px solid var(--pill-blue-border); }
 .h-delta.warn { background: var(--pill-orange-bg); color: var(--orange); border: 1px solid var(--pill-orange-border); }
@@ -699,6 +700,11 @@ function render() {
   const rangeIsPreAic = !!bounds.end && bounds.end < AIC_START;
   const heroLabel = rangeIsPreAic ? 'Premium Requests' : 'AI Credits Spent';
   const heroValue = rangeIsPreAic ? Math.round(t.premium).toLocaleString() : aicTotal;
+  // Provenance split. GitHub's ledger is authoritative; local debug logs only
+  // ever account for part of it. Two cards rather than one blended number the
+  // user cannot reconcile against github.com.
+  const heroQuota = DATA.aicSummary && DATA.aicSummary.quota;
+  const showQuotaSplit = !rangeIsPreAic && heroQuota && selectedRange === 'tm';
   const heroSub = rangeIsPreAic
     ? rl + ' · pre-AIC · turns × multiplier'
     : rl + ' · ' + t.sessions + ' sessions · ' + t.turns + ' turns';
@@ -746,26 +752,53 @@ function render() {
   // cares about — spend, overage, pace, projection — all range-scoped and
   // consistent (sum reconciles across the whole page).
   const promo = DATA.aicSummary?.promo || {};
-  const isPromo = promo.isPromoActive && promo.promoBudget > 0;
+  // A live quota snapshot outranks the promo table: it reports the entitlement
+  // this seat can actually draw on, promo included.
+  const isPromo = !heroQuota && promo.isPromoActive && promo.promoBudget > 0;
   const overageCost = DATA.aicSummary?.config?.overageCostPerCredit ?? 0.01;
   const effectiveBudget = isPromo ? promo.promoBudget : (DATA.aicSummary?.monthlyBudget || 0);
   const rangeOverageDollars = rangeIsPreAic || effectiveBudget <= 0
     ? 0
-    : Math.max(0, rangeAicTotal - effectiveBudget) * overageCost;
+    : showQuotaSplit
+      ? DATA.aicSummary.estimatedOverageCost
+      : Math.max(0, rangeAicTotal - effectiveBudget) * overageCost;
   const overageLabel = rangeIsPreAic ? 'Overage (n/a)' : isPromo ? 'Overage (with promo)' : 'Overage';
   const overageSub = rangeIsPreAic
     ? 'pre-AIC — GitHub billed premium requests, not credits'
-    : effectiveBudget > 0
-      ? '@ $' + overageCost + '/credit over ' + effectiveBudget + ' budget'
-      : 'no budget set';
+    : effectiveBudget <= 0
+      ? 'no budget set'
+      : rangeOverageDollars > 0
+        ? '@ $' + overageCost + '/credit over ' + effectiveBudget.toLocaleString() + ' budget'
+        : 'within ' + effectiveBudget.toLocaleString() + ' credit budget';
   const paceSub = heroActiveDayCount + ' active day' + (heroActiveDayCount === 1 ? '' : 's');
   const projectedValue = rangeIsLive ? Math.round(heroProjected).toLocaleString() : rangeAicTotal.toFixed(0);
   const projectedSub = rangeIsLive ? 'end of cycle' : 'range total (closed)';
   const projectedAccent = rangeIsLive && projPct >= 100 ? 'orange' : rangeIsLive && projPct >= 80 ? 'orange' : 'green';
 
+  // Card 1 is what the local debug logs prove; card 2 is what GitHub actually
+  // billed. Overage only earns a slot once there is one — at $0.00 it was a
+  // full card restating what the GitHub card's subtitle already says.
+  const localCard = showQuotaSplit
+    ? {l:'AIC — Local Logs', v:heroQuota.localTotal.toLocaleString(),
+       sub:'tracked on this machine · ' + t.sessions + ' sessions · ' + t.turns + ' turns',
+       accent:'blue',
+       delta:'<span class="h-delta down">' + (heroQuota.localDelta >= 0 ? '−' : '+')
+             + Math.abs(heroQuota.localDelta).toLocaleString() + ' vs GitHub</span>'}
+    : {l:heroLabel, v:heroValue, sub:heroSub, accent:'orange', delta:spendDelta};
+  const githubCard = showQuotaSplit
+    ? {l:'AIC — GitHub', v:heroValue,
+       sub:'billed ledger · ' + Math.round(heroQuota.remaining).toLocaleString() + ' left of '
+           + heroQuota.entitlement.toLocaleString(),
+       accent:'orange', delta:spendDelta}
+    : {l:overageLabel, v:'$'+rangeOverageDollars.toFixed(2), sub:overageSub, accent:'red', delta:''};
+  const overageCard = showQuotaSplit && rangeOverageDollars > 0
+    ? [{l:overageLabel, v:'$'+rangeOverageDollars.toFixed(2), sub:overageSub, accent:'red', delta:''}]
+    : [];
+
   document.getElementById('hero-stats').innerHTML = [
-    {l:heroLabel,          v:heroValue,                              sub: heroSub, accent:'orange', delta:spendDelta},
-    {l:overageLabel,       v:'$'+rangeOverageDollars.toFixed(2),    sub: overageSub, accent:'red', delta:''},
+    localCard,
+    githubCard,
+    ...overageCard,
     // Cache Hit formula MUST match cache.ts (single source of truth). The
     // arithmetic is inlined here only because the aggregate is built from a
     // user-selected range at render time — extension host can't pre-compute
@@ -876,7 +909,7 @@ function buildCreditCalendar(cycleStart, cycleEnd, dayMap) {
   // Get first day of month and total days
   const firstOfMonth = new Date(year, month, 1);
   const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const startDow = (firstOfMonth.getDay() + 6) % 7; // Monday=0
+  const startDow = firstOfMonth.getDay(); // Sunday=0, so the work week sits mid-grid
 
   // Collect credits for this month and find max for color scaling
   const monthCredits = [];
@@ -898,8 +931,8 @@ function buildCreditCalendar(cycleStart, cycleEnd, dayMap) {
     + String(_now.getMonth() + 1).padStart(2, '0') + '-'
     + String(_now.getDate()).padStart(2, '0');
 
-  // Build grid: 7 columns (Mon-Sun), enough rows for the month
-  const dayHeaders = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  // Build grid: 7 columns (Sun-Sat), enough rows for the month
+  const dayHeaders = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   let headerRow = '<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px;margin-bottom:4px">';
   dayHeaders.forEach(dh => {
     headerRow += '<div style="text-align:center;font-size:9px;color:var(--muted);font-weight:600">'+dh+'</div>';
@@ -1047,11 +1080,10 @@ function renderAIC(aic, bounds, filteredSessions) {
   // bill only the credits that exceed your plan's included allowance.
   const overageCost = aic.config ? aic.config.overageCostPerCredit : 0.01;
   const rangeGrossValue = rangeTotal * overageCost;
+  // Total Credits / Daily Avg / Projected are the hero tiles verbatim, so only
+  // the one figure the hero does not carry earns a row here.
   const statsCards = [
-    {l:'Total Credits',v:rangeTotal.toFixed(1),s:planLabel+' plan · $'+rangeGrossValue.toFixed(2)+' gross value',c:'orange'},
-    {l:'Prompt Tokens',v:fmt(rangePromptTokens),s:'input to models'},
-    {l:'Daily Avg',v:rangeDailyAvg.toFixed(1),s:activeDayCount+' active day'+(activeDayCount===1?'':'s')},
-    {l:'Projected',v:rangeProjected.toFixed(0),s:projectedSub,c:aicRangeIsLive && projPct>=100?'red':aicRangeIsLive && projPct>=80?'orange':''},
+    {l:'Prompt Tokens',v:fmt(rangePromptTokens),s:'input to models · $'+rangeGrossValue.toFixed(2)+' gross value at '+planLabel+' rates'},
   ];
 
   // Overage card(s): recalculate from range-filtered total. "Overage" bills
@@ -1068,10 +1100,14 @@ function renderAIC(aic, bounds, filteredSessions) {
       + '<div class="stat-card" style="border-left:3px solid var(--green)"><div class="label">Promo Savings</div><div class="value green">$'+rangePromoSavings.toFixed(2)+'</div><div class="sub">ends '+promo.promoEndDate+'</div></div>'
       + '</div>';
   } else {
+    // Only worth a card once there is something to pay. At $0.00 it restated
+    // what the reconciliation note directly beneath it already says.
     const rangeOverage = Math.max(0, rangeTotal - aic.monthlyBudget) * overageCost;
-    overageHTML = '<div class="stats-row" style="margin-top:8px">'
-      + '<div class="stat-card"><div class="label">Overage Cost</div><div class="value'+(rangeOverage > 0?' red':'')+'">$'+rangeOverage.toFixed(2)+'</div><div class="sub">@ $'+overageCost+'/credit</div></div>'
-      + '</div>';
+    if (rangeOverage > 0) {
+      overageHTML = '<div class="stats-row" style="margin-top:8px">'
+        + '<div class="stat-card"><div class="label">Overage Cost</div><div class="value red">$'+rangeOverage.toFixed(2)+'</div><div class="sub">@ $'+overageCost+'/credit</div></div>'
+        + '</div>';
+    }
   }
 
   // Model breakdown table — computed from range-filtered sessions.
@@ -1126,6 +1162,18 @@ function renderAIC(aic, bounds, filteredSessions) {
       });
   }
 
+  // Credits GitHub billed that no local log accounts for. Shown as its own row
+  // so the table's TOTAL still reconciles to the hero instead of silently
+  // falling short of it by the same amount.
+  if (aic.quota && aic.quota.localDelta > 0 && selectedRange === 'tm') {
+    modelRows += '<tr><td><span class="model-tag" style="opacity:.75">unattributed</span> '
+      + '<span class="mult-badge" title="Billed by GitHub but not present in the local debug logs — other devices/IDEs, github.com, cloud agent, or wrapper calls that omit per-request credits">no local log</span></td>'
+      + '<td class="num"><span style="color:var(--muted)">—</span></td>'
+      + '<td class="num"><span style="color:var(--muted)">—</span></td>'
+      + '<td class="num cached"><span style="color:var(--muted)">—</span></td>'
+      + '<td class="num orange">'+aic.quota.localDelta.toFixed(2)+'</td></tr>';
+  }
+
   // Daily credits calendar — finalDayMap built above already merges aic.byDay
   // (authoritative, current cycle) with session-derived data (any month).
   const calStart = bounds.start || aic.billingCycleStart;
@@ -1135,8 +1183,11 @@ function renderAIC(aic, bounds, filteredSessions) {
   // Estimation note. A range that closed before AIC billing began can only be
   // a rate-table estimate, no matter what the current cycle's data looks like.
   const rangeIsPreAic = !!bounds.end && bounds.end < AIC_START;
+  const q = aic.quota;
   const cacheNote = rangeIsPreAic
     ? '<div style="margin-top:8px;padding:6px 10px;background:var(--border);border-radius:4px;font-size:10px;color:var(--muted)">⚠️ <strong>Pre-AIC estimate:</strong> AI Credits billing started '+AIC_START+'. Credits for this period are reconstructed from token counts at published per-model rates — GitHub did not bill them.</div>'
+    : q
+    ? '<div style="margin-top:8px;padding:6px 10px;background:var(--border);border-radius:4px;font-size:10px;color:#4ec9b0">✓ <strong>Reconciled with GitHub:</strong> '+q.creditsUsed.toLocaleString()+' of '+q.entitlement.toLocaleString()+' credits used this cycle, read from GitHub&rsquo;s own ledger (quota_snapshots). Local logs account for '+q.localTotal.toLocaleString()+' — the '+(q.localDelta >= 0 ? '+' : '')+q.localDelta.toLocaleString()+' difference is usage billed outside this machine&rsquo;s debug logs (other devices/IDEs, github.com, cloud agent, or wrapper calls that omit per-request credits).</div>'
     : aic.isActualFromApi
     ? '<div style="margin-top:8px;padding:6px 10px;background:var(--border);border-radius:4px;font-size:10px;color:#4ec9b0">✓ <strong>Actual billing data:</strong> Credits sourced from API-reported copilotUsageNanoAiu per request. Includes cache discounts.</div>'
     : aic.cachedCredits === 0
@@ -1191,11 +1242,12 @@ function renderAIC(aic, bounds, filteredSessions) {
       nb.byDay
         .filter(d => (!bounds.start || d.day >= bounds.start) && (!bounds.end || d.day <= bounds.end))
         .forEach(d => {
-          const row = nbAgg[d.model] || (nbAgg[d.model] = {model:d.model,tier:d.tier,inputCredits:0,outputCredits:0,cachedCredits:0,totalCredits:0});
+          const row = nbAgg[d.model] || (nbAgg[d.model] = {model:d.model,tier:d.tier,inputCredits:0,outputCredits:0,cachedCredits:0,totalCredits:0,providerUsd:undefined});
           row.inputCredits += d.inputCredits;
           row.outputCredits += d.outputCredits;
           row.cachedCredits += d.cachedCredits;
           row.totalCredits += d.totalCredits;
+          if (d.providerUsd !== undefined) { row.providerUsd = (row.providerUsd || 0) + d.providerUsd; }
           nbTotal += d.totalCredits;
         });
     } else if (useOriginalByModel) {
@@ -1209,28 +1261,40 @@ function renderAIC(aic, bounds, filteredSessions) {
       .sort((a, b) => b.totalCredits - a.totalCredits);
     if (nbVisible.length > 0) {
       let nbRows = '';
+      let nbUsdTotal = 0;
+      let nbAnyUsd = false;
       nbVisible.forEach(m => {
         const tierBadge = m.tier === 'premium'
           ? '<span class="mult-badge mult-high">premium</span>'
           : m.tier === 'base'
             ? '<span class="mult-badge mult-1">base</span>'
             : '<span class="mult-badge">custom</span>';
+        // No configured rate must read as "unknown", never as a free $0.00.
+        const usdCell = m.providerUsd === undefined
+          ? '<span style="color:var(--muted)" title="No provider rate configured for this model — set copilotUsage.byokPricing">—</span>'
+          : '$'+m.providerUsd.toFixed(2);
+        if (m.providerUsd !== undefined) { nbUsdTotal += m.providerUsd; nbAnyUsd = true; }
         nbRows += '<tr><td><span class="model-tag '+mc(m.model)+'">'+esc(m.model)+'</span> '+tierBadge+'</td>'
           + '<td class="num">'+m.inputCredits.toFixed(2)+'</td>'
           + '<td class="num">'+m.outputCredits.toFixed(2)+'</td>'
           + '<td class="num cached">'+m.cachedCredits.toFixed(2)+'</td>'
-          + '<td class="num" style="color:var(--muted)">'+m.totalCredits.toFixed(2)+'</td></tr>';
+          + '<td class="num" style="color:var(--muted)">'+m.totalCredits.toFixed(2)+'</td>'
+          + '<td class="num orange">'+usdCell+'</td></tr>';
       });
       nonBillableHTML = '<div style="margin-top:16px;padding-top:12px;border-top:1px dashed var(--border)">'
         + '<div class="section-title" style="margin-bottom:6px">Non-billable models (informational)</div>'
         + '<div style="font-size:11px;color:var(--muted);margin-bottom:8px">'
         + 'GitHub Copilot does <strong>not</strong> bill these models — they appear here only so you can see local Ollama, LM Studio, BYOK, or unrecognised model traffic, and they are <strong>excluded from the billed total above</strong>. '
-        + 'Numbers are AI credits, not tokens (1 credit = $0.01). For agent sessions the total is the <em>cost billed by the provider itself</em>; where no provider cost is recorded it is a Copilot rate-table estimate. The input/output/cached split is apportioned from token counts. '
-        + 'Toggle <code>copilotUsage.aic.includeOnlyBilledModels</code> off to restore legacy behaviour.'
+        + 'The credit columns are Copilot-equivalent AI credits (1 credit = $0.01) — what this traffic <em>would</em> have cost on Copilot, which is not a figure on any invoice you receive. '
+        + '<strong>Provider cost</strong> is the real one: your own provider\u2019s published rates applied to the same tokens, in USD. It is a separate vendor\u2019s bill and is never added to AI credits. '
+        + 'Cached tokens are priced as cache <em>reads</em> unless <code>copilotUsage.byokPricing.cacheWriteRatio</code> says otherwise, so the dollar figure is a lower bound. '
+        + 'Set rates via <code>copilotUsage.byokPricing</code>; toggle <code>copilotUsage.aic.includeOnlyBilledModels</code> off to restore legacy behaviour.'
         + '</div>'
-        + '<table><thead><tr><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cached</th><th class="num">Total (credits)</th></tr></thead><tbody>'
+        + '<table><thead><tr><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cached</th><th class="num">Total (credits)</th><th class="num">Provider cost</th></tr></thead><tbody>'
         + nbRows
-        + '</tbody><tfoot><tr><td colspan="4" style="text-align:right;color:var(--muted)">Non-billable total (informational):</td><td class="num" style="color:var(--muted)"><strong>'+nbTotal.toFixed(2)+'</strong></td></tr></tfoot></table>'
+        + '</tbody><tfoot><tr><td colspan="4" style="text-align:right;color:var(--muted)">Non-billable total (informational):</td>'
+        + '<td class="num" style="color:var(--muted)"><strong>'+nbTotal.toFixed(2)+'</strong></td>'
+        + '<td class="num orange"><strong>'+(nbAnyUsd ? '$'+nbUsdTotal.toFixed(2) : '—')+'</strong></td></tr></tfoot></table>'
         + '</div>';
     }
   }
@@ -1658,16 +1722,61 @@ function renderSessions(sessions, subs, bounds) {
     // Cache % is pre-computed in dashboardData.ts (see cache.ts). Webview
     // never inlines the arithmetic — one source of truth for the formula.
     const cacheCell=s.actualPrompt>0?'<td class="num cached">'+(s.cacheHitPct||0).toFixed(1)+'%</td>':'<td class="num">—</td>';
+    // Live prompt-cache countdown. Only sessions still inside a cache window
+    // have an anchor; everything else is historical and shows a dash.
+    const ttlA=(DATA.ttlBySession||{})[s.sessionId];
+    const ttlCell=ttlA
+      ? '<td class="num ttl-cell" data-ttl="'+esc(s.sessionId)+'" title="'+esc(ttlA.provider)+' cache · approximate">'+ttlText(ttlA)+'</td>'
+      : '<td class="num">—</td>';
     // Range-scoped, same basis as Usage-by-Model — so this column sums to the
     // hero tile rather than to the session's whole lifetime.
     const sc=sessionCreditsInRange(s,bounds);
     const costCell=sc?'<td class="num orange">$'+(sc*rate).toFixed(2)+'</td>':'<td class="num">—</td>';
-    rows+='<tr><td style="font-family:monospace;font-size:11px">'+esc(s.sessionShort)+'...</td><td>'+esc(s.project)+'</td><td>'+sum+'</td><td style="font-size:11px">'+esc(s.last)+'</td><td class="num">'+s.durationMin+'m</td><td><span class="model-tag '+mc(s.modelName)+'">'+esc(s.modelName)+'</span>'+mbadge(mult)+'</td><td class="num">'+s.turns+'</td><td class="num">'+fmt(s.actualPrompt||s.prompt)+'</td><td class="num">'+fmt(s.actualOutput||s.output)+'</td>'+cacheCell+'<td class="num">'+fmt(s.toolCalls)+'</td><td class="num">'+(s.subagents||'')+(sd?' '+sd:'')+'</td><td class="num">'+(sc?sc.toFixed(1):'—')+'</td>'+costCell+'<td>'+flDiv+'</td></tr>';
+    rows+='<tr><td style="font-family:monospace;font-size:11px">'+esc(s.sessionShort)+'...</td><td>'+esc(s.project)+'</td><td>'+sum+'</td><td style="font-size:11px">'+esc(s.last)+'</td><td class="num">'+s.durationMin+'m</td><td><span class="model-tag '+mc(s.modelName)+'">'+esc(s.modelName)+'</span>'+mbadge(mult)+'</td><td class="num">'+s.turns+'</td><td class="num">'+fmt(s.actualPrompt||s.prompt)+'</td><td class="num">'+fmt(s.actualOutput||s.output)+'</td>'+cacheCell+ttlCell+'<td class="num">'+fmt(s.toolCalls)+'</td><td class="num">'+(s.subagents||'')+(sd?' '+sd:'')+'</td><td class="num">'+(sc?sc.toFixed(1):'—')+'</td>'+costCell+'<td>'+flDiv+'</td></tr>';
   });
-  el.innerHTML='<div class="table-card"><div class="section-title">All Sessions &mdash; '+sessions.length+' shown</div><div class="sessions-scroll table-scroll"><table><thead><tr><th>Session</th><th>Project</th><th>Summary</th><th>Last Active</th><th class="num">Duration</th><th>Model</th><th class="num">Turns</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Cache %</th><th class="num">Tools</th><th class="num">Subagents</th><th class="num">AI Credits</th><th class="num">Cost</th><th>Files</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+  el.innerHTML='<div class="table-card"><div class="section-title">All Sessions &mdash; '+sessions.length+' shown</div><div class="sessions-scroll table-scroll"><table><thead><tr><th>Session</th><th>Project</th><th>Summary</th><th>Last Active</th><th class="num">Duration</th><th>Model</th><th class="num">Turns</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Cache %</th><th class="num" title="Time left before the prompt cache is assumed cold. Approximate and configurable.">Cache TTL</th><th class="num">Tools</th><th class="num">Subagents</th><th class="num">AI Credits</th><th class="num">Cost</th><th>Files</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
   el.querySelectorAll('.file-link[data-path]').forEach(link => {
     link.addEventListener('click', () => { vscode.postMessage({type:'openFile',path:link.dataset.path}); });
   });
+  startTtlTicker();
+}
+
+// ── Prompt-cache TTL cells ─────────────────────────────────
+// Mirrors src/ttlState.ts. The countdown ticks locally between data pushes so
+// the column stays live without a round-trip to the extension host.
+function ttlState(a) {
+  if (a.working) return 'hot';
+  const remaining = a.timerValue - (Date.now() - a.lastRequestMs) / 1000;
+  if (remaining <= 0) return 'cold';
+  if (remaining <= a.alertAt) return 'red';
+  if (remaining <= a.warnAt) return 'yellow';
+  return 'green';
+}
+
+function ttlText(a) {
+  const st = ttlState(a);
+  const dot = st === 'hot' ? '🔥' : st === 'green' ? '🟢' : st === 'yellow' ? '🟡' : st === 'red' ? '🔴' : '❄️';
+  if (st === 'hot') return dot + ' HOT';
+  if (st === 'cold') return dot + ' COLD';
+  const s = Math.max(0, Math.floor(a.timerValue - (Date.now() - a.lastRequestMs) / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const p2 = n => (n < 10 ? '0' + n : '' + n);
+  return dot + ' ' + (h >= 1 ? h + ':' + p2(m) + ':' + p2(sec) : m + ':' + p2(sec));
+}
+
+let ttlTimer = null;
+function startTtlTicker() {
+  if (ttlTimer) { clearInterval(ttlTimer); ttlTimer = null; }
+  const anchors = DATA.ttlBySession || {};
+  if (!Object.keys(anchors).length) return;
+  ttlTimer = setInterval(() => {
+    const cells = document.querySelectorAll('.ttl-cell[data-ttl]');
+    if (!cells.length) { clearInterval(ttlTimer); ttlTimer = null; return; }
+    cells.forEach(c => {
+      const a = anchors[c.dataset.ttl];
+      if (a) c.textContent = ttlText(a);
+    });
+  }, 1000);
 }
 
 function renderModelTable(sessions, bounds, rangeAicTotal) {

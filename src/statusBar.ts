@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { LiveStats } from "./otelReceiver";
 import { ScanStats } from "./scanner";
 import { computeCacheHit, tierLabel } from "./cache";
+import { SessionTtl, aggregateText, shortTitle, stateDisplay, stateEmoji } from "./ttlState";
 
 /** Format a credit delta as a compact dollar/cent string for the flash badge. */
 function fmtDelta(credits: number, dollarPerCredit: number): string {
@@ -94,12 +95,31 @@ export interface StatusBarData {
    */
   liveSessionPrompt?: number;
   liveSessionCached?: number;
+  /**
+   * Prompt-cache TTL sessions from `TtlTracker`, most-urgent first. Undefined
+   * or empty when `copilotUsage.cacheTtl.enabled` is off. Rendered as a
+   * countdown segment in the bar and a session list under "Cache reuse".
+   */
+  ttlSessions?: SessionTtl[];
+  /** Mirrors `copilotUsage.cacheTtl.showInStatusBar`. */
+  ttlShowInStatusBar?: boolean;
+  /** Mirrors `copilotUsage.cacheTtl.maxSessions` (tooltip list cap). */
+  ttlMaxSessions?: number;
 }
 
 export interface PeriodStats {
   aic: number;
   tokens: number;
   byModel: Array<{ model: string; tokens: number }>;
+}
+
+/**
+ * Fingerprint of what the tooltip's TTL rows would say. Deliberately excludes
+ * `remaining` — the countdown ticks every second, and rebuilding on it is what
+ * made an open hover flicker.
+ */
+function ttlKey(sessions: SessionTtl[]): string {
+  return sessions.map(s => `${s.sessionId}:${s.state}`).join("|");
 }
 
 export class StatusBarProvider {
@@ -116,6 +136,8 @@ export class StatusBarProvider {
   private flashTimer: ReturnType<typeof setTimeout> | undefined;
   /** Last data pushed in, cached so the flash timer can re-render without new input. */
   private lastData: StatusBarData | null = null;
+  /** Session+state fingerprint of the last tooltip build — see `refreshTtl`. */
+  private ttlTooltipKey = "";
 
   constructor(private commandId: string) {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -151,8 +173,14 @@ export class StatusBarProvider {
    * All token counts, model name, session id, and workspace totals remain in
    * the tooltip — the bar surfaces only the cost number the user can act on.
    */
-  updateStatus(data: StatusBarData | null): void {
+  updateStatus(data: StatusBarData | null, opts?: { skipTooltip?: boolean }): void {
     this.lastData = data;
+    const skipTooltip = opts?.skipTooltip === true;
+    if (!skipTooltip) {
+      // Keep the fingerprint in step with what the tooltip actually shows, so
+      // the next tick can tell "nothing changed" from "never built".
+      this.ttlTooltipKey = ttlKey(data?.ttlSessions ?? []);
+    }
 
     const otel = data?.otel;
     const hasOtel = otel && otel.requests > 0;
@@ -172,12 +200,18 @@ export class StatusBarProvider {
     this.applyLimitTheme(dl);
     const limitPrefix = this.limitPrefix(dl);
 
+    // Prompt-cache countdown for the most urgent session. Always trails the
+    // cost so the daily-limit fraction keeps the leading position.
+    const ttlSegment = this.ttlSegment(data);
+
     // Any AIC seen for this window (OTel, cs, or the dashData overlay) means active.
     const sessionAIC = data?.currentSessionAIC ?? cs?.aicCredits ?? 0;
     if (!hasOtel && !cs && sessionAIC <= 0) {
-      this.item.text = `${limitPrefix}$(dashboard)`;
+      this.item.text = `${limitPrefix}$(dashboard)${ttlSegment}`;
       this.lastRenderedText = this.item.text;
-      this.item.tooltip = this.buildTooltipForIdle(dl);
+      if (!skipTooltip) {
+        this.item.tooltip = this.buildTooltipForIdle(dl, data);
+      }
       return;
     }
 
@@ -217,9 +251,50 @@ export class StatusBarProvider {
       body = `$(zap) $${sessionDollars.toFixed(2)}${delta}`;
     }
 
-    this.item.text = `${limitPrefix}${body}`;
+    this.item.text = `${limitPrefix}${body}${ttlSegment}`;
     this.lastRenderedText = this.item.text;
-    this.item.tooltip = this.buildTooltipActive(data, otel, cs, dl);
+    if (!skipTooltip) {
+      this.item.tooltip = this.buildTooltipActive(data, otel, cs, dl);
+    }
+  }
+
+  /** ` • 🟡 2:15` for the most urgent tracked session, or `""` when disabled. */
+  private ttlSegment(data: StatusBarData | null): string {
+    if (!data?.ttlShowInStatusBar) {
+      return "";
+    }
+    const text = aggregateText(data.ttlSessions ?? []);
+    return text ? ` \u2022 ${text}` : "";
+  }
+
+  /**
+   * Per-session countdown rows for the tooltip's "Cache reuse" block. Cost is
+   * the exact API-billed figure (`copilotUsageNanoAiu`), not an estimate.
+   */
+  private ttlRowsMd(data: StatusBarData | null): string[] {
+    const sessions = data?.ttlSessions ?? [];
+    if (sessions.length === 0) {
+      return [];
+    }
+    const cap = Math.max(1, data?.ttlMaxSessions ?? 20);
+    const md: string[] = [];
+    md.push(`| &nbsp; | &nbsp; |`);
+    md.push(`|:--|--:|`);
+    for (const s of sessions.slice(0, cap)) {
+      const left = `${stateEmoji(s.state)} ${stateDisplay(s.state, s.remaining)}`;
+      // The hover has no max-width: whatever this row measures, the whole
+      // tooltip stretches to. Keep the title short and drop zero-cost noise.
+      const tag = s.source === "cli" ? "CLI &nbsp;·&nbsp; " : "";
+      const cost = s.costUsd > 0 ? `${tag}$${s.costUsd.toFixed(2)}` : tag.trim();
+      md.push(
+        `| ${left} &nbsp; ${escapeMd(shortTitle(s.title, 22))} | ${cost || "&nbsp;"} |`
+      );
+    }
+    if (sessions.length > cap) {
+      md.push(`| <span style="color:${COL.muted}">+${sessions.length - cap} more</span> | &nbsp; |`);
+    }
+    md.push("");
+    return md;
   }
 
   /**
@@ -352,9 +427,14 @@ export class StatusBarProvider {
     const cacheP = (data?.liveSessionPrompt ?? otel?.prompt) ?? 0;
     const cacheC = (data?.liveSessionCached ?? otel?.cached) ?? 0;
     const sessionHit = computeCacheHit(cacheP, cacheC);
+    const ttlRows = this.ttlRowsMd(data);
     if (sessionHit.tier !== "empty") {
-      const label =
-        sessionHit.tier === "excellent"
+      const lead = data?.ttlSessions?.[0];
+      // The countdown answers "how long can I keep this reuse rate" — it
+      // belongs on the same card as the rate itself, not in its own widget.
+      const label = lead
+        ? `<span style="color:${COL.info}">${stateEmoji(lead.state)} ${stateDisplay(lead.state, lead.remaining)} left</span>`
+        : sessionHit.tier === "excellent"
           ? `<span style="color:${COL.info}">$(sparkle) ${tierLabel(sessionHit.tier)}</span>`
           : `<span style="color:${COL.muted}">$(archive) ${tierLabel(sessionHit.tier)}</span>`;
       md.push(`**$(archive) Cache reuse** &nbsp;&nbsp; ${label}`);
@@ -365,6 +445,14 @@ export class StatusBarProvider {
         `<span style="color:${COL.muted}">${sessionHit.cached.toLocaleString()} cached &nbsp;·&nbsp; ${sessionHit.pct.toFixed(0)}% of input</span>`
       );
       md.push("");
+      md.push(...ttlRows);
+    } else if (ttlRows.length > 0) {
+      const lead = data!.ttlSessions![0];
+      md.push(
+        `**$(archive) Cache reuse** &nbsp;&nbsp; <span style="color:${COL.info}">${stateEmoji(lead.state)} ${stateDisplay(lead.state, lead.remaining)} left</span>`
+      );
+      md.push("");
+      md.push(...ttlRows);
     }
 
     // Single-pair native markdown table. Right-alignment via `--:`;
@@ -433,6 +521,26 @@ export class StatusBarProvider {
       this.flashTimer = undefined;
     }
     this.item.dispose();
+  }
+
+  /**
+   * Re-render with fresh TTL sessions only. Called once per second by
+   * `TtlTracker`, so it must never trigger a scan or a `buildData()` — it
+   * swaps the countdown into the cached payload and repaints.
+   */
+  refreshTtl(sessions: SessionTtl[]): void {
+    if (!this.lastData) {
+      return;
+    }
+    // Assigning `item.tooltip` tears down an open hover, so a per-second
+    // rebuild makes it flicker. The bar text still ticks every second; the
+    // tooltip is rebuilt only when a session changes colour band.
+    const skipTooltip = ttlKey(sessions) === this.ttlTooltipKey;
+
+    // A flash badge must not re-fire just because the clock ticked.
+    const prevSeen = this.lastSeenRequestAIC;
+    this.updateStatus({ ...this.lastData, ttlSessions: sessions }, { skipTooltip });
+    this.lastSeenRequestAIC = prevSeen;
   }
 
   // ─── Daily-limit theming helpers ────────────────────────────
@@ -521,11 +629,21 @@ export class StatusBarProvider {
     return f[this.walkFrame % f.length];
   }
 
-  private buildTooltipForIdle(dl: StatusBarData["dailyLimit"]): vscode.MarkdownString {
+  private buildTooltipForIdle(
+    dl: StatusBarData["dailyLimit"],
+    data?: StatusBarData | null
+  ): vscode.MarkdownString {
     const md: string[] = [];
     md.push(`### $(dashboard) Copilot Usage`);
     md.push(`<span style="color:${COL.muted}">No activity yet in this window.</span>`);
     md.push("");
+    // Another window's sessions can still hold a warm cache worth showing.
+    const ttlRows = this.ttlRowsMd(data ?? null);
+    if (ttlRows.length > 0) {
+      md.push(`**$(archive) Cache reuse**`);
+      md.push("");
+      md.push(...ttlRows);
+    }
     if (dl && dl.stage !== "none") {
       const pctUsed = Math.min(100, Math.max(0, dl.percent));
       const barColor =

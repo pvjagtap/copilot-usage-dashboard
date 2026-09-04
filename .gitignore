@@ -2,6 +2,10 @@ node_modules/
 out/
 tests-out/
 *.vsix
+dist/
+# Captured session corpora — hundreds of MB of real log data, kept local only.
+tests/20*_*/
+tests/20*_*.zip
 gen-icon.ps1
 copilot_all_tools.jsonl
 .history/
