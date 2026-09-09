@@ -1300,12 +1300,29 @@ function renderAIC(aic, bounds, filteredSessions) {
   }
 
   // ── Systems (cross-machine rollups shared over Settings Sync) ──────────
-  // Rendered only when a second machine has reported, since a one-row table
-  // just repeats the headline numbers. The headline tiles above stay strictly
-  // machine-local so they remain reconcilable against a single local source.
+  // Shown for a single system too: the headline tile now carries GitHub's
+  // account-wide ledger, so this machine's own share is a different number and
+  // the one-row table is no longer a restatement of it.
+  //
+  // Driven by each slot's synced byDay map rather than its cycleCredits
+  // scalar, so the table answers the selected range like every other panel.
+  // A machine that was wiped stops republishing and its slot freezes on the
+  // cycle it died in — keyed off cycleCredits it could then only ever appear
+  // in that one cycle's view, and never under "All Time".
+  const rangeHasDay = d => (!bounds.start || d >= bounds.start) && (!bounds.end || d <= bounds.end);
   let systemsHTML = '';
-  const machines = (DATA.machines || []).filter(m => m && m.host);
-  if (machines.length > 1) {
+  const machines = (DATA.machines || []).filter(m => m && m.host).map(m => {
+    const days = Object.keys(m.byDay || {}).filter(rangeHasDay);
+    return {
+      m,
+      days,
+      credits: days.reduce((s, d) => s + (m.byDay[d] || 0), 0),
+      // A slot that has not published a day map yet still deserves a row in
+      // the cycle it reported.
+      cycleInRange: rangeHasDay(m.cycleStart),
+    };
+  }).filter(x => x.days.length > 0 || x.cycleInRange);
+  if (machines.length > 0) {
     const ago = ts => {
       const mins = Math.max(0, Math.round((Date.now() - ts) / 60000));
       if (mins < 60) return mins + 'm ago';
@@ -1314,52 +1331,78 @@ function renderAIC(aic, bounds, filteredSessions) {
       return Math.round(hrs / 24) + 'd ago';
     };
     let combined = 0;
+    let legacyCount = 0;
     const rate = (aic.config && aic.config.overageCostPerCredit) || 0.01;
     const usd = c => '$' + (c * rate).toFixed(2);
-    const sysRows = machines.map(m => {
-      const sameCycle = m.cycleStart === aic.billingCycleStart;
-      if (sameCycle) combined += (m.cycleCredits || 0);
+    const sysRows = machines.map(x => {
+      const m = x.m;
+      // A pre-fix slot reported the whole account, so its number cannot be
+      // shown as one system's nor added to the others.
+      const legacy = m.creditsAreLocal === false;
+      // Counters are a whole-slot snapshot, not per-day, so they only describe
+      // the cycle the slot last reported.
+      const countersApply = x.cycleInRange;
+      const credits = x.days.length > 0 ? x.credits : (countersApply ? (m.cycleCredits || 0) : 0);
+      if (legacy) legacyCount++; else combined += credits;
       const tag = m.isThisMachine
         ? ' <span style="color:#4ec9b0;font-size:10px">(this system)</span>'
         : '';
       const stale = m.dormant
         ? ' <span style="color:#e5c07b;font-size:10px" title="No update in over 7 days — its figures may be out of date">dormant</span>'
         : '';
-      const cyc = sameCycle
-        ? ''
-        : ' <span style="color:#e5c07b;font-size:10px" title="Reported against a different billing cycle, so it is excluded from the combined total">other cycle</span>';
+      const pending = legacy
+        ? ' <span style="color:#e5c07b;font-size:10px" title="This system last reported from a build that published the account-wide ledger instead of its own usage. It republishes correct figures once it updates.">pre-1.11.4</span>'
+        : '';
+      const dash = '<td class="num" style="color:var(--muted)">&mdash;</td>';
+      const creditCell = legacy
+        ? dash + dash
+        : '<td class="num">'+credits.toFixed(2)+'</td>'
+          + '<td class="num" style="color:var(--muted)">'+usd(credits)+'</td>';
+      const counterCell = countersApply
+        ? '<td class="num">'+(m.sessions||0)+'</td>'
+          + '<td class="num">'+(m.turns||0)+'</td>'
+          + '<td class="num">'+(m.totalTokens||0).toLocaleString()+'</td>'
+        : dash + dash + dash;
       return '<tr><td><strong>'+esc(m.label)+'</strong>'+tag+'</td>'
-        + '<td>'+esc(m.host)+' <span style="color:var(--muted);font-size:10px">'+esc(m.platform)+'</span></td>'
-        + '<td class="num">'+(+(m.cycleCredits||0)).toFixed(2)+cyc+'</td>'
-        + '<td class="num" style="color:var(--muted)">'+usd(m.cycleCredits||0)+'</td>'
-        + '<td class="num">'+(m.sessions||0)+'</td>'
-        + '<td class="num">'+(m.turns||0)+'</td>'
-        + '<td class="num">'+(m.totalTokens||0).toLocaleString()+'</td>'
+        + '<td>'+esc(m.host)+' <span style="color:var(--muted);font-size:10px">'+esc(m.platform)+'</span>'+pending+'</td>'
+        + creditCell
+        + counterCell
         + '<td>'+ago(m.lastSeen)+stale+'</td></tr>';
     }).join('');
 
     // The budget is an account allowance, not a per-machine one, so overage is
     // only meaningful against the combined figure — the per-system dollar
-    // amounts above are gross value at the same rate, not separate bills.
+    // amounts above are gross value at the same rate, not separate bills. It
+    // is also a per-cycle allowance, so it is withheld for any range that is
+    // not exactly the current cycle.
+    const rangeIsCycle = bounds.start === aic.billingCycleStart && !bounds.end;
     const effBudget = isPromo ? promo.promoBudget : (aic.monthlyBudget || 0);
     const overCombined = effBudget > 0 ? Math.max(0, combined - effBudget) : 0;
-    const overageRow = effBudget > 0
+    const overageRow = effBudget > 0 && rangeIsCycle
       ? '<tr><td colspan="3" style="text-align:right;color:var(--muted)">'
         + 'Combined overage vs '+effBudget.toLocaleString()+'-credit allowance'+(isPromo ? ' (promo)' : '')+':</td>'
         + '<td class="num"><strong style="color:'+(overCombined > 0 ? 'var(--orange)' : 'var(--green)')+'">'
         + '$'+(overCombined * rate).toFixed(2)+'</strong></td><td colspan="4"></td></tr>'
       : '';
+    const legacyNote = legacyCount > 0
+      ? ' <span style="color:#e5c07b">'+legacyCount+' system'+(legacyCount === 1 ? '' : 's')
+        + ' not yet counted &mdash; still on a build that reported the account-wide ledger.</span>'
+      : '';
+    const rangeName = RANGE_LABELS[selectedRange] || selectedRange;
 
     systemsHTML = '<div style="margin-top:16px">'
       + '<div class="section-title" style="margin-bottom:8px">Systems — Combined Usage</div>'
       + '<div style="padding:8px 10px;background:var(--border);border-radius:4px;font-size:10px;color:var(--muted);margin-bottom:8px">'
       + 'Each system publishes a rollup of its own credits over Settings Sync. Logs, prompts and session contents are never shared. '
-      + 'The headline tiles above remain this-system-only, so they stay reconcilable against local data; the combined figure is shown here. '
+      + 'Credits follow the selected range; sessions, turns and tokens are a whole-slot snapshot and show &mdash; outside the cycle a '
+      + 'system last reported. Each system reports what its own local logs account for &mdash; not the account-wide ledger &mdash; so '
+      + 'the systems sum to a meaningful combined figure. '
       + 'Per-system cost is credits &times; $'+rate+' &mdash; gross value, not a separate bill. Only the combined overage below is chargeable.'
+      + legacyNote
       + '</div>'
-      + '<table><thead><tr><th>System</th><th>Host</th><th class="num">Credits (cycle)</th><th class="num">Cost</th><th class="num">Sessions</th><th class="num">Turns</th><th class="num">Tokens</th><th>Last seen</th></tr></thead><tbody>'
+      + '<table><thead><tr><th>System</th><th>Host</th><th class="num">Credits ('+esc(rangeName)+')</th><th class="num">Cost</th><th class="num">Sessions</th><th class="num">Turns</th><th class="num">Tokens</th><th>Last seen</th></tr></thead><tbody>'
       + sysRows
-      + '</tbody><tfoot><tr><td colspan="2" style="text-align:right;color:var(--muted)">Combined this cycle:</td>'
+      + '</tbody><tfoot><tr><td colspan="2" style="text-align:right;color:var(--muted)">Combined '+esc(rangeName.toLowerCase())+':</td>'
       + '<td class="num"><strong>'+combined.toFixed(2)+'</strong></td>'
       + '<td class="num"><strong>'+usd(combined)+'</strong></td><td colspan="4"></td></tr>'
       + overageRow

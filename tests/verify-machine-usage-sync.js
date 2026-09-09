@@ -124,14 +124,36 @@ console.log("\n4. Dormant machines are flagged, not silently summed");
 console.log("\n5. Combined total only sums matching billing cycles");
 {
   const map = {
-    "a": { host: "a", platform: "win32", firstSeen: 1, lastSeen: Date.now(), cycleStart: "2026-08-01", cycleCredits: 100.5, sessions: 0, turns: 0, totalTokens: 0, byDay: {}, byModel: {} },
-    "b": { host: "b", platform: "win32", firstSeen: 2, lastSeen: Date.now(), cycleStart: "2026-08-01", cycleCredits: 20.25, sessions: 0, turns: 0, totalTokens: 0, byDay: {}, byModel: {} },
-    "c": { host: "c", platform: "win32", firstSeen: 3, lastSeen: Date.now(), cycleStart: "2026-07-01", cycleCredits: 999, sessions: 0, turns: 0, totalTokens: 0, byDay: {}, byModel: {} },
+    "a": { host: "a", platform: "win32", firstSeen: 1, lastSeen: Date.now(), cycleStart: "2026-08-01", cycleCredits: 100.5, sessions: 0, turns: 0, totalTokens: 0, byDay: {}, byModel: {}, schema: 2 },
+    "b": { host: "b", platform: "win32", firstSeen: 2, lastSeen: Date.now(), cycleStart: "2026-08-01", cycleCredits: 20.25, sessions: 0, turns: 0, totalTokens: 0, byDay: {}, byModel: {}, schema: 2 },
+    "c": { host: "c", platform: "win32", firstSeen: 3, lastSeen: Date.now(), cycleStart: "2026-07-01", cycleCredits: 999, sessions: 0, turns: 0, totalTokens: 0, byDay: {}, byModel: {}, schema: 2 },
   };
   MACHINE_ID = "a";
   const views = sync.readMachines(ctxFor({ [KEY]: map }));
   const total = sync.combinedCredits(views, "2026-08-01");
   check("sums current cycle only", total === 120.75, String(total));
+}
+
+console.log("\n5b. Pre-fix slots stay visible but are never summed");
+{
+  // A schema-less slot carried GitHub's account-wide ledger as its credits.
+  // Adding it would restate the whole account on top of the real machines.
+  const map = {
+    "legacy": { host: "desktop", platform: "win32", firstSeen: 1, lastSeen: Date.now(), cycleStart: "2026-08-01", cycleCredits: 42069, sessions: 221, turns: 2564, byDay: {}, byModel: {}, totalTokens: 0 },
+    "fixed": { host: "laptop", platform: "linux", firstSeen: 2, lastSeen: Date.now(), cycleStart: "2026-08-01", cycleCredits: 767.15, sessions: 3, turns: 82, totalTokens: 0, byDay: {}, byModel: {}, schema: 2 },
+  };
+  MACHINE_ID = "fixed";
+  const views = sync.readMachines(ctxFor({ [KEY]: map }));
+  const legacy = views.find(v => v.id === "legacy");
+
+  check("legacy system still listed", !!legacy && legacy.host === "desktop");
+  check("legacy credits flagged as not machine-local", legacy.creditsAreLocal === false);
+  check("legacy counters still readable", legacy.sessions === 221 && legacy.turns === 2564);
+  check("upgraded system flagged as machine-local",
+    views.find(v => v.id === "fixed").creditsAreLocal === true);
+  check("combined excludes the account-wide figure",
+    sync.combinedCredits(views, "2026-08-01") === 767.15,
+    String(sync.combinedCredits(views, "2026-08-01")));
 }
 
 console.log("\n6. Daily history is trimmed so the payload stays bounded");
@@ -142,8 +164,7 @@ console.log("\n6. Daily history is trimmed so the payload stays bounded");
     byDay[d] = 1;
   }
   MACHINE_ID = "machine-A";
-  const ctx = ctxFor();
-  sync.__resetThrottleForTesting();
+  const ctx = ctxFor();  sync.__resetThrottleForTesting();
   sync.publishAndRead(ctx, usage({ byDay }));
   const slot = ctx.__raw.get(KEY)["machine-A"];
   const days = Object.keys(slot.byDay);
@@ -152,6 +173,48 @@ console.log("\n6. Daily history is trimmed so the payload stays bounded");
   const bytes = Buffer.byteLength(JSON.stringify(ctx.__raw.get(KEY)), "utf8");
   check("full-history slot well under the 512 KB sync threshold",
     bytes < 512 * 1024 / 4, bytes + " bytes");
+}
+
+console.log("\n6b. Daily history accumulates instead of being overwritten");
+{
+  // Debug logs rotate and closed cycles stop being rescanned, so a publish
+  // routinely sees fewer days than the slot already holds. Replacing the map
+  // would drop a retired machine's only surviving record.
+  MACHINE_ID = "machine-A";
+  const ctx = ctxFor();
+
+  sync.__resetThrottleForTesting();
+  sync.publishAndRead(ctx, usage({
+    cycleStart: "2026-08-01",
+    byDay: { "2026-08-01": 10, "2026-08-02": 20 },
+  }));
+
+  // Next cycle: the scan no longer covers August at all.
+  sync.__resetThrottleForTesting();
+  sync.publishAndRead(ctx, usage({
+    cycleStart: "2026-09-01",
+    byDay: { "2026-09-01": 5 },
+  }));
+
+  const slot = ctx.__raw.get(KEY)["machine-A"];
+  check("last cycle's days survive the next publish",
+    slot.byDay["2026-08-01"] === 10 && slot.byDay["2026-08-02"] === 20,
+    JSON.stringify(slot.byDay));
+  check("current day recorded alongside", slot.byDay["2026-09-01"] === 5);
+  check("closed cycle still totals correctly from byDay",
+    slot.byDay["2026-08-01"] + slot.byDay["2026-08-02"] === 30);
+
+  // A day the scan can no longer see reports 0 — that is absence of evidence,
+  // not evidence the day cost nothing.
+  sync.__resetThrottleForTesting();
+  sync.publishAndRead(ctx, usage({
+    cycleStart: "2026-09-01",
+    byDay: { "2026-08-01": 0, "2026-09-01": 7 },
+  }));
+  const after = ctx.__raw.get(KEY)["machine-A"];
+  check("a zero does not erase a stored day", after.byDay["2026-08-01"] === 10,
+    String(after.byDay["2026-08-01"]));
+  check("a non-zero recomputation does supersede", after.byDay["2026-09-01"] === 7);
 }
 
 console.log("\n7. Republishing preserves firstSeen so numbering does not shuffle");

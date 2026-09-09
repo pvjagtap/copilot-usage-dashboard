@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.4] - 2026-09-08
+
+### Fixed
+
+- **"Systems — Combined Usage" credited every machine with the whole
+  account's spend.** A Linux laptop with 3 sessions and 97 requests reported
+  42,069 credits — more than a Windows workstation with 221 sessions — and the
+  combined row then summed that same figure once per machine.
+
+  1.11.3 made `aicSummary.totalCredits` adopt GitHub's `quota_snapshots`
+  ledger, which is correct for the headline tile but is an *account* figure: on
+  a pooled Business or Enterprise seat it covers every machine, every IDE and
+  every member of the org. The per-machine rollup published over Settings Sync
+  kept reading that same field, so each system republished the account total as
+  its own. The table's other columns had the mirror-image problem — sessions,
+  turns and tokens were all-time and included OMP/Pi/CLI agents, under a header
+  that reads "Credits (cycle)".
+
+  `AICDashboardData` now also carries `localTotalCredits` and `localByDay` —
+  the same numbers before the ledger delta is folded in — and the rollup
+  publishes those, with sessions, turns and tokens clipped to the billing
+  cycle and to VS Code chat.
+
+  Slots carry a `schema` field rather than the `globalState` key being
+  versioned. Bumping the key would have hidden every machine that has not
+  updated yet, and a machine only republishes when its own VS Code restarts.
+  A pre-fix system therefore still appears in the table with its host and
+  counters, tagged `pre-1.11.4`, but its credits render as `—` and are left
+  out of the combined total until it updates.
+
+- **The Systems table ignored the range selector.** It was keyed off each
+  slot's single `cycleCredits` scalar and hard-filtered to the current billing
+  cycle, so a system could only ever appear in the one cycle it last reported
+  — including under "All Time". A machine that has been wiped stops
+  republishing and its slot freezes on the cycle it died in, which meant the
+  only surviving record of that system was unreachable from every range.
+
+  Credits per system are now summed from the slot's synced `byDay` map for the
+  selected range, so the table answers the range selector like every other
+  panel. Sessions, turns and tokens are a whole-slot snapshot rather than a
+  per-day series, so they render as `—` outside the cycle a system last
+  reported instead of being silently misattributed. The combined-overage row
+  is withheld for any range that is not exactly the current cycle, since the
+  allowance is per-cycle.
+
+- **A machine's daily history was thrown away on every publish.** The slot
+  declared a 120-day retention window, but `byDay` was replaced wholesale each
+  time rather than merged, so it only ever held what the current scan could
+  still see — one or two days in practice. Debug logs rotate, workspaceStorage
+  folders get cleaned up, and a closed cycle stops being recomputed, so days
+  that had been recorded correctly vanished on the next write. The retention
+  window applied to nothing.
+
+  This matters most for a machine that is gone: `vscode.env.machineId` changes
+  after an OS reinstall, so a rebuilt machine gets a fresh slot and the old one
+  can never republish. Its slot is the only surviving record of that system's
+  usage.
+
+  `byDay` now accumulates. A recomputed day supersedes the stored one, but only
+  when it is non-zero — zero means the scan can no longer see that day, not
+  that nothing was spent there.
+
+- **Last cycle's machines appeared in this cycle's Systems table.** Slots from
+  an older billing cycle were rendered with an "other cycle" tag and excluded
+  from the combined total — a row showing 89,185 credits directly above a
+  combined figure that did not include it. They are now dropped from the table
+  entirely.
+
 ## [1.11.3] - 2026-09-04
 
 ### Fixed

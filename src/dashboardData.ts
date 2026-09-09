@@ -402,6 +402,15 @@ export interface AICDashboardData {
   /** Per-day credit totals */
   byDay: Array<{ day: string; credits: number }>;
   /**
+   * `byDay` before GitHub's ledger delta is folded in — credits this machine's
+   * own logs account for. `byDay`/`totalCredits` adopt the account-wide
+   * `quota_snapshots` figure, which on a pooled seat covers every machine, IDE
+   * and org member, so anything per-machine must read these instead.
+   */
+  localByDay: Array<{ day: string; credits: number }>;
+  /** Σ `localByDay` — the machine-local total behind `totalCredits`. */
+  localTotalCredits: number;
+  /**
    * Billable credits per day that belong to no scanned VS Code chat session —
    * live OTel requests not yet flushed to a debug log, plus OMP / Pi / CLI
    * agent sessions. `byDay` = Σ SessionView.aicByDay + this, per day.
@@ -1926,6 +1935,10 @@ export function buildDashboardData(scan: ScanResult, liveStats: LiveStats | null
     byDay: Array.from(reconciledByDay.entries())
       .map(([day, credits]) => ({ day, credits: Math.round(credits * 100) / 100 }))
       .sort((a, b) => a.day.localeCompare(b.day)),
+    localByDay: Array.from(summary.byDay.entries())
+      .map(([day, credits]) => ({ day, credits: Math.round(credits * 100) / 100 }))
+      .sort((a, b) => a.day.localeCompare(b.day)),
+    localTotalCredits: localTotalCr,
     unattributedByDay: Array.from(unattributedByDay.entries())
       .map(([day, credits]) => ({ day, credits: Math.round(credits * 100) / 100 }))
       .filter(d => d.credits > 0)

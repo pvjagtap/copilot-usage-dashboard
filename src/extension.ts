@@ -139,19 +139,38 @@ function buildData(): DashboardData {
 
   // Publish this machine's rollup and fold in whatever other systems have
   // synced. Rollups only — never raw sessions, prompts or log contents.
+  //
+  // Every figure published here must be BOTH machine-local and clipped to the
+  // billing cycle, because the Systems table sums slots across machines. The
+  // headline `aic.totalCredits` is neither: on a pooled seat it is GitHub's
+  // account-wide `quota_snapshots` figure, already covering every machine in
+  // the org, so publishing it made each system report the whole account and
+  // the combined total multiply it. `localByDay` / `localTotalCredits` are the
+  // same numbers before that reconciliation.
   if (extCtx) {
     const aic = cachedDashData.aicSummary;
+    // Full local history, not just this cycle: the slot accumulates days and
+    // retains 120 of them, so a closed cycle stays recoverable from a machine
+    // that has since been wiped or retired.
     const byDay: Record<string, number> = {};
-    for (const d of aic.byDay) { byDay[d.day] = d.credits; }
+    for (const d of aic.localByDay) { byDay[d.day] = d.credits; }
     const byModel: Record<string, number> = {};
     for (const m of aic.byModel) { byModel[m.model] = m.totalCredits; }
+    const inCycle = (ts: string): boolean => {
+      const day = (ts || "").slice(0, 10);
+      return day >= aic.billingCycleStart && day <= aic.billingCycleEnd;
+    };
+    const cycleTurns = scan.turns.filter(t => inCycle(t.timestamp));
     try {
       const machines = publishAndRead(extCtx, {
         cycleStart: aic.billingCycleStart,
-        cycleCredits: aic.totalCredits,
-        sessions: cachedDashData.agentSummary.totalSessions,
-        turns: scan.turns.length,
-        totalTokens: cachedDashData.agentSummary.vscodeTotalTokens,
+        cycleCredits: aic.localTotalCredits,
+        sessions: new Set(cycleTurns.map(t => t.sessionId)).size,
+        turns: cycleTurns.length,
+        totalTokens: cycleTurns.reduce(
+          (s, t) => s + (t.debugPromptTokens || t.promptTokens) + (t.debugOutputTokens || t.outputTokens),
+          0,
+        ),
         byDay,
         byModel,
       });

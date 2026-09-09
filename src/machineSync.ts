@@ -20,8 +20,25 @@ import * as vscode from "vscode";
 import * as os from "os";
 import { CATALOG_SYNC_KEY } from "./modelCatalog";
 
-/** globalState key for the per-machine usage rollups. */
+/**
+ * globalState key for the per-machine usage rollups.
+ *
+ * Deliberately unversioned: bumping it would hide every machine that has not
+ * upgraded yet, and a machine only republishes when its own VS Code restarts.
+ * Slots carry `schema` instead, so a stale rollup still identifies its system.
+ */
 const MACHINES_KEY = "copilotUsage.usage.machines.v1";
+
+/**
+ * Slot format this build writes.
+ *
+ * 1 — `cycleCredits` held `aicSummary.totalCredits`, which on a pooled seat is
+ *     GitHub's account-wide ledger, not the machine's own usage. Unusable in a
+ *     sum: every machine reported the whole account.
+ * 2 — `cycleCredits` is machine-local, and the counters are clipped to the
+ *     billing cycle.
+ */
+const SLOT_SCHEMA = 2;
 
 /** Days of daily history retained per machine — bounds the synced payload. */
 const RETAIN_DAYS = 120;
@@ -60,6 +77,8 @@ export interface MachineSlot {
   byDay: Record<string, number>;
   /** model id → credits in the current cycle. */
   byModel: Record<string, number>;
+  /** Absent on slots written before the local-credits fix — see `SLOT_SCHEMA`. */
+  schema?: number;
 }
 
 /** A slot decorated for display. */
@@ -70,6 +89,12 @@ export interface MachineView extends MachineSlot {
   label: string;
   isThisMachine: boolean;
   dormant: boolean;
+  /**
+   * Whether `cycleCredits` describes this machine alone. False for pre-fix
+   * slots, whose figure is the whole account's — render the system, withhold
+   * the number, and leave it out of any sum.
+   */
+  creditsAreLocal: boolean;
 }
 
 /** What the caller measured locally this refresh. */
@@ -108,6 +133,29 @@ function trimDays(byDay: Record<string, number>): Record<string, number> {
 }
 
 /**
+ * Folds this refresh's daily credits into what the slot already held.
+ *
+ * A plain replace loses history the scan can no longer see: debug logs rotate,
+ * workspaceStorage folders get cleaned up, and a closed cycle's days stop
+ * being recomputed — so days that were published correctly would silently
+ * disappear on the next write, and `RETAIN_DAYS` never applied to anything.
+ *
+ * A recomputed day supersedes the stored one, but only when it is non-zero:
+ * zero means "this scan can no longer see that day", not "nothing was spent".
+ */
+function mergeDays(
+  prior: Record<string, number> | undefined,
+  local: Record<string, number>
+): Record<string, number> {
+  const out: Record<string, number> = { ...(prior ?? {}) };
+  for (const [day, credits] of Object.entries(local)) {
+    if (credits > 0) out[day] = credits;
+    else if (out[day] === undefined) out[day] = 0;
+  }
+  return trimDays(out);
+}
+
+/**
  * Writes this machine's slot and returns every known machine, ordered and
  * labelled. Read-modify-write so a synced update from another machine is
  * preserved rather than overwritten.
@@ -139,8 +187,9 @@ export function publishAndRead(
     sessions: local.sessions,
     turns: local.turns,
     totalTokens: local.totalTokens,
-    byDay: trimDays(local.byDay),
+    byDay: mergeDays(prior?.byDay, local.byDay),
     byModel: local.byModel,
+    schema: SLOT_SCHEMA,
   };
 
   lastPublishAt = now;
@@ -178,13 +227,14 @@ function decorate(
       label: `System ${i + 1}`,
       isThisMachine: id === thisId,
       dormant: now - slot.lastSeen > DORMANT_MS,
+      creditsAreLocal: (slot.schema ?? 1) >= SLOT_SCHEMA,
     }));
 }
 
 /** Sums slots that describe the same billing cycle. */
 export function combinedCredits(views: MachineView[], cycleStart: string): number {
   const total = views
-    .filter(v => v.cycleStart === cycleStart)
+    .filter(v => v.cycleStart === cycleStart && v.creditsAreLocal)
     .reduce((s, v) => s + (v.cycleCredits || 0), 0);
   return Math.round(total * 100) / 100;
 }
